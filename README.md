@@ -49,6 +49,13 @@
 
 ## Install
 
+## Experimental DGX Path
+
+This repository now also includes an experimental `omlx_dgx` package for
+researching a DGX-oriented runtime around SGLang/HiCache, with TensorRT-LLM kept
+as a research backend. See
+[README.dgx.md](README.dgx.md) for the current scope and launcher.
+
 ### macOS App
 
 Download the `.dmg` from [Releases](https://github.com/jundot/omlx/releases), drag to Applications, done. The app includes in-app auto-update, so future upgrades are just one click.

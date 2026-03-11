@@ -56,6 +56,7 @@ cover/
 # Environments
 .env
 .venv
+.venv-sglang/
 env/
 venv/
 ENV/
@@ -92,6 +93,7 @@ logs/
 tmp/
 temp/
 *.tmp
+.runtime/
 
 # MLX cache
 .mlx_cache/

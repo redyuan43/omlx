@@ -81,6 +81,7 @@ Repository = "https://github.com/jundot/omlx"
 
 [project.scripts]
 omlx = "omlx.cli:main"
+omlx-dgx = "omlx_dgx.cli:main"
 
 [tool.setuptools.dynamic]
 version = {attr = "omlx._version.__version__"}
