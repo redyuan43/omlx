@@ -26,6 +26,18 @@ def serve_command(args: argparse.Namespace) -> None:
         settings.config.backend.runtime_python = args.runtime_python
     if args.model_repo_id:
         settings.config.backend.model_repo_id = args.model_repo_id
+    if args.chunked_prefill_size is not None:
+        settings.config.backend.chunked_prefill_size = args.chunked_prefill_size
+    if args.enable_hierarchical_cache is not None:
+        settings.config.backend.enable_hierarchical_cache = (
+            args.enable_hierarchical_cache
+        )
+    if args.hicache_size_gb is not None:
+        settings.config.backend.hicache_size = args.hicache_size_gb
+    if args.hicache_pass_prefix_keys is not None:
+        settings.config.backend.hicache_storage_backend_extra_config[
+            "hicache_storage_pass_prefix_keys"
+        ] = args.hicache_pass_prefix_keys
     if args.model_id:
         settings.ensure_model(
             ModelProfile(
@@ -60,6 +72,18 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--model-id", default="")
     serve.add_argument("--model-alias", default=None)
     serve.add_argument("--model-repo-id", default="")
+    serve.add_argument("--chunked-prefill-size", type=int, default=None)
+    serve.add_argument(
+        "--enable-hierarchical-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    serve.add_argument("--hicache-size-gb", type=int, default=None)
+    serve.add_argument(
+        "--hicache-pass-prefix-keys",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     serve.set_defaults(func=serve_command)
     return parser
 

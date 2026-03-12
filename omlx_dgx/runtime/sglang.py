@@ -72,6 +72,66 @@ def _coerce_response_payload(response) -> Dict[str, Any]:
     }
 
 
+def _latest_model_config_path(model_repo_id: str) -> Optional[Path]:
+    candidate = Path(model_repo_id).expanduser()
+    if candidate.is_dir():
+        config_path = candidate / "config.json"
+        if config_path.exists():
+            return config_path
+
+    cache_root = (
+        Path.home()
+        / ".cache"
+        / "huggingface"
+        / "hub"
+        / f"models--{model_repo_id.replace('/', '--')}"
+        / "snapshots"
+    )
+    if not cache_root.exists():
+        return None
+
+    configs = sorted(
+        cache_root.glob("*/config.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return configs[0] if configs else None
+
+
+def _inspect_model_traits(model_repo_id: str) -> Dict[str, Any]:
+    traits: Dict[str, Any] = {
+        "config_path": "",
+        "model_type": "",
+        "architectures": [],
+        "hicache_supported": None,
+        "hicache_blocker": "",
+    }
+    config_path = _latest_model_config_path(model_repo_id)
+    if config_path is None:
+        return traits
+
+    traits["config_path"] = str(config_path)
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        traits["hicache_blocker"] = f"failed to parse model config: {exc}"
+        return traits
+
+    architectures = config.get("architectures") or []
+    model_type = config.get("model_type") or ""
+    traits["architectures"] = architectures
+    traits["model_type"] = model_type
+
+    if model_type.startswith("qwen3_5") or "Qwen3_5ForConditionalGeneration" in architectures:
+        traits["hicache_supported"] = False
+        traits["hicache_blocker"] = (
+            "installed SGLang HiCache only supports MHA/MLA caches, while "
+            "Qwen3.5 uses the hybrid GDN/Mamba cache path"
+        )
+
+    return traits
+
+
 @dataclass
 class SGLangDiagnostics:
     adapter: str
@@ -83,8 +143,12 @@ class SGLangDiagnostics:
     sglang_package_version: str
     sgl_kernel_package_version: str
     model_repo_id: str
+    model_config_path: str
+    model_type: str
+    model_architectures: List[str]
     tensor_parallel_size: int
     context_length: int
+    chunked_prefill_size: int
     chat_template: str
     attention_backend: str
     reasoning_parser: str
@@ -94,6 +158,8 @@ class SGLangDiagnostics:
     enable_hierarchical_cache: bool
     hicache_storage_backend: str
     hicache_storage_root: str
+    hicache_supported: Optional[bool]
+    hicache_blocker: str
     launcher_cmd: str
     managed_pid: Optional[int]
     managed_process_running: bool
@@ -261,6 +327,8 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             str(self.config.tensor_parallel_size),
             "--context-length",
             str(self.config.context_length),
+            "--chunked-prefill-size",
+            str(self.config.chunked_prefill_size),
             "--mem-fraction-static",
             str(self.config.mem_fraction_static),
         ]
@@ -313,6 +381,7 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
 
     def diagnostics(self) -> SGLangDiagnostics:
         command = self._build_launch_command()
+        model_traits = _inspect_model_traits(self.config.model_repo_id)
         return SGLangDiagnostics(
             adapter="sglang",
             base_url=self.base_url,
@@ -323,8 +392,12 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             sglang_package_version=self._package_version("sglang"),
             sgl_kernel_package_version=self._package_version("sgl-kernel"),
             model_repo_id=self.config.model_repo_id,
+            model_config_path=model_traits["config_path"],
+            model_type=model_traits["model_type"],
+            model_architectures=list(model_traits["architectures"]),
             tensor_parallel_size=self.config.tensor_parallel_size,
             context_length=self.config.context_length,
+            chunked_prefill_size=self.config.chunked_prefill_size,
             chat_template=self.config.chat_template or "",
             attention_backend=self.config.attention_backend,
             reasoning_parser=self.config.reasoning_parser,
@@ -336,6 +409,8 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             hicache_storage_root=str(
                 Path(self.config.hicache_storage_root).expanduser().resolve()
             ),
+            hicache_supported=model_traits["hicache_supported"],
+            hicache_blocker=model_traits["hicache_blocker"],
             launcher_cmd=_stringify_command(command),
             managed_pid=self.process_manager.pid(),
             managed_process_running=self.process_manager.is_running(),
@@ -421,6 +496,15 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
         return metrics
 
     def start_runtime(self) -> Dict[str, Any]:
+        diagnostics = self.diagnostics()
+        if (
+            self.config.enable_hierarchical_cache
+            and diagnostics.hicache_supported is False
+        ):
+            raise BackendError(
+                f"HiCache is not supported for {self.config.model_repo_id}: "
+                f"{diagnostics.hicache_blocker}. Disable hierarchical cache for this model."
+            )
         command = self._build_launch_command()
         env = self._build_env()
         result = self.process_manager.start(command, env=env)

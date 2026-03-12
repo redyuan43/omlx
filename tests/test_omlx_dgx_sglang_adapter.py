@@ -4,8 +4,11 @@ import json
 import time
 from pathlib import Path
 
+import pytest
+
 from omlx_dgx.config import BackendConfig
 from omlx_dgx.runtime import sglang as sglang_module
+from omlx_dgx.runtime.backend import BackendError
 from omlx_dgx.runtime.sglang import SGLangBackendAdapter
 
 
@@ -53,6 +56,8 @@ def test_sglang_adapter_builds_launch_command_and_env(
     assert "--model-path" in command
     assert "--tp-size" in command
     assert "--context-length" in command
+    assert "--chunked-prefill-size" in command
+    assert command[command.index("--chunked-prefill-size") + 1] == "8192"
     assert "--chat-template" not in command
     assert "--attention-backend" in command
     assert command[command.index("--attention-backend") + 1] == "triton"
@@ -66,6 +71,7 @@ def test_sglang_adapter_builds_launch_command_and_env(
         "prefetch_threshold": 256,
         "prefetch_timeout_base": 0.5,
         "prefetch_timeout_per_ki_token": 0.25,
+        "hicache_storage_pass_prefix_keys": True,
     }
     assert env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] == str(
         Path(config.hicache_storage_root).expanduser().resolve()
@@ -76,6 +82,7 @@ def test_sglang_adapter_builds_launch_command_and_env(
     diagnostics = adapter.diagnostics().to_dict()
     assert diagnostics["adapter"] == "sglang"
     assert diagnostics["attention_backend"] == "triton"
+    assert diagnostics["chunked_prefill_size"] == 8192
     assert diagnostics["hicache_storage_backend"] == "file"
     assert diagnostics["admin_api_key_configured"] is True
 
@@ -182,12 +189,48 @@ def test_sglang_adapter_hicache_and_metrics_calls_use_admin_auth(
     assert any(path == "hicache/storage-backend" and method == "PUT" for method, path, _, _ in calls)
 
 
+def test_sglang_adapter_surfaces_hicache_incompatibility_for_qwen35(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(sglang_module, "_runtime_python_exists", lambda _: False)
+    model_dir = tmp_path / "Qwen3.5-4B"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_5",
+                "architectures": ["Qwen3_5ForConditionalGeneration"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = BackendConfig(
+        kind="sglang",
+        base_url="http://127.0.0.1:31000",
+        runtime_python="/opt/venvs/sglang/bin/python",
+        model_repo_id=str(model_dir),
+        enable_hierarchical_cache=True,
+    )
+    adapter = SGLangBackendAdapter.from_backend_config(config, tmp_path)
+
+    diagnostics = adapter.diagnostics().to_dict()
+
+    assert diagnostics["model_type"] == "qwen3_5"
+    assert diagnostics["model_architectures"] == ["Qwen3_5ForConditionalGeneration"]
+    assert diagnostics["hicache_supported"] is False
+    assert "hybrid GDN/Mamba" in diagnostics["hicache_blocker"]
+
+    with pytest.raises(BackendError, match="HiCache is not supported"):
+        adapter.start_runtime()
+
+
 def test_sglang_adapter_can_manage_process_lifecycle(tmp_path: Path, monkeypatch):
     config = BackendConfig(
         kind="sglang",
         base_url="http://127.0.0.1:33000",
         launcher_cmd="python3 -c \"import time; print('sglang-started', flush=True); time.sleep(5)\"",
         startup_timeout_seconds=2,
+        enable_hierarchical_cache=False,
     )
     adapter = SGLangBackendAdapter.from_backend_config(config, tmp_path)
     health_checks = {"count": 0}

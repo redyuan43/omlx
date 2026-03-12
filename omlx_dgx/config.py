@@ -43,6 +43,7 @@ class BackendConfig:
     attention_backend: str = "triton"
     reasoning_parser: str = "qwen3"
     mem_fraction_static: float = 0.80
+    chunked_prefill_size: int = 8192
     trust_remote_code: bool = True
     enable_metrics: bool = True
     enable_cache_report: bool = True
@@ -61,6 +62,7 @@ class BackendConfig:
             "prefetch_threshold": 256,
             "prefetch_timeout_base": 0.5,
             "prefetch_timeout_per_ki_token": 0.25,
+            "hicache_storage_pass_prefix_keys": True,
         }
     )
     admin_api_key: str = "omlx-dgx-admin"
