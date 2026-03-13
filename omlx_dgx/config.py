@@ -30,20 +30,53 @@ def parse_size(size_str: str) -> int:
 class BackendConfig:
     kind: str = "sglang"
     base_url: str = "http://127.0.0.1:30000"
+    adaptive_backend_base_url: str = ""
     container_image: str = "nvcr.io/nvidia/tensorrt-llm:latest"
     engine_dir: str = ""
+    launcher_binary: str = "llama-server"
     model_repo_id: str = "Qwen/Qwen3.5-35B-A3B"
+    quant_mode: str = "bf16"
+    model_source: str = "hf"
+    artifact_path: str = ""
+    gguf_variant: str = ""
     launcher_cmd: str = ""
     runtime_python: str = "python3"
     startup_timeout_seconds: int = 120
     direct_api_enabled: bool = True
     tensor_parallel_size: int = 1
     context_length: int = 65536
+    ctx_size: int = 16384
+    parallel_slots: int = 1
+    n_gpu_layers: int = 999
+    flash_attn: bool = True
+    batch_size: int = 2048
+    ubatch_size: int = 512
+    cache_ram_mib: int = 8192
+    cache_reuse: int = 0
+    checkpoint_every_n_tokens: int = 8192
+    ctx_checkpoints: int = 32
+    slot_prompt_similarity: float = 0.10
+    enable_runtime_metrics: bool = False
+    enable_session_stickiness: bool = True
+    sticky_session_prompt_threshold: int = 2048
+    sticky_max_sessions: int = 256
+    split_mode: str = "row"
+    no_context_shift: bool = True
+    jinja: bool = True
+    reasoning_format: str = "deepseek"
     chat_template: Optional[str] = ""
     attention_backend: str = "triton"
     reasoning_parser: str = "qwen3"
+    mamba_ssm_dtype: str = ""
     mem_fraction_static: float = 0.80
+    disable_cuda_graph: bool = False
+    prefill_strategy: str = "fixed"
     chunked_prefill_size: int = 8192
+    fixed_chunked_prefill_size: int = 8192
+    adaptive_short_prompt_threshold: int = 2048
+    adaptive_long_context_chunk_size: int = 8192
+    adaptive_repeat_prefix_chunk_size: int = 1024
+    adaptive_max_sticky_sessions: int = 256
     trust_remote_code: bool = True
     enable_metrics: bool = True
     enable_cache_report: bool = True
@@ -66,6 +99,34 @@ class BackendConfig:
         }
     )
     admin_api_key: str = "omlx-dgx-admin"
+
+    def __post_init__(self) -> None:
+        if self.quant_mode not in {
+            "bf16",
+            "awq_int4",
+            "awq_marlin_int4",
+            "gguf_experimental",
+            "lmstudio_baseline",
+        }:
+            self.quant_mode = "bf16"
+        if self.model_source not in {"hf", "gguf", "lmstudio_api"}:
+            self.model_source = "hf"
+        if self.split_mode not in {"none", "layer", "row"}:
+            self.split_mode = "row"
+        if self.mamba_ssm_dtype not in {"", "float32", "bfloat16", "float16"}:
+            self.mamba_ssm_dtype = ""
+        if self.quant_mode == "gguf_experimental":
+            self.model_source = "gguf"
+        elif self.quant_mode == "lmstudio_baseline" and self.model_source == "hf":
+            self.model_source = "lmstudio_api"
+        if not self.fixed_chunked_prefill_size:
+            self.fixed_chunked_prefill_size = self.chunked_prefill_size or 8192
+        if not self.chunked_prefill_size:
+            self.chunked_prefill_size = self.fixed_chunked_prefill_size
+        if not self.adaptive_long_context_chunk_size:
+            self.adaptive_long_context_chunk_size = self.fixed_chunked_prefill_size
+        if self.prefill_strategy not in {"fixed", "adaptive"}:
+            self.prefill_strategy = "fixed"
 
 
 @dataclass
@@ -145,12 +206,23 @@ class DGXRuntimeConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "DGXRuntimeConfig":
+        backend_data = dict(data.get("backend", {}))
+        legacy_chunk_size = backend_data.get("chunked_prefill_size")
+        if "fixed_chunked_prefill_size" not in backend_data and legacy_chunk_size:
+            backend_data["fixed_chunked_prefill_size"] = legacy_chunk_size
+        if "adaptive_long_context_chunk_size" not in backend_data:
+            backend_data["adaptive_long_context_chunk_size"] = backend_data.get(
+                "fixed_chunked_prefill_size",
+                legacy_chunk_size or 8192,
+            )
+        if "chunked_prefill_size" not in backend_data and "fixed_chunked_prefill_size" in backend_data:
+            backend_data["chunked_prefill_size"] = backend_data["fixed_chunked_prefill_size"]
         models = {
             model_id: ModelProfile(**profile)
             for model_id, profile in data.get("models", {}).items()
         }
         return cls(
-            backend=BackendConfig(**data.get("backend", {})),
+            backend=BackendConfig(**backend_data),
             cache=CacheConfig(**data.get("cache", {})),
             control_plane=ControlPlaneConfig(**data.get("control_plane", {})),
             models=models,

@@ -58,6 +58,8 @@ def test_sglang_adapter_builds_launch_command_and_env(
     assert "--context-length" in command
     assert "--chunked-prefill-size" in command
     assert command[command.index("--chunked-prefill-size") + 1] == "8192"
+    assert "--dtype" in command
+    assert command[command.index("--dtype") + 1] == "bfloat16"
     assert "--chat-template" not in command
     assert "--attention-backend" in command
     assert command[command.index("--attention-backend") + 1] == "triton"
@@ -81,10 +83,17 @@ def test_sglang_adapter_builds_launch_command_and_env(
 
     diagnostics = adapter.diagnostics().to_dict()
     assert diagnostics["adapter"] == "sglang"
+    assert diagnostics["backend_format"] == "sglang_bf16"
+    assert diagnostics["quant_mode"] == "bf16"
+    assert diagnostics["model_source"] == "hf"
+    assert diagnostics["effective_model_path"] == "Qwen/Qwen3.5-35B-A3B"
     assert diagnostics["attention_backend"] == "triton"
+    assert diagnostics["mamba_ssm_dtype"] == ""
+    assert diagnostics["disable_cuda_graph"] is False
     assert diagnostics["chunked_prefill_size"] == 8192
     assert diagnostics["hicache_storage_backend"] == "file"
     assert diagnostics["admin_api_key_configured"] is True
+    assert diagnostics["artifact_summary"]["artifact_kind"] == "remote_ref"
 
 
 def test_sglang_adapter_includes_chat_template_when_configured(
@@ -106,6 +115,116 @@ def test_sglang_adapter_includes_chat_template_when_configured(
     assert "--chat-template" in command
     assert command[command.index("--chat-template") + 1] == "custom-template"
     assert command[command.index("--attention-backend") + 1] == "trtllm_mha"
+
+
+def test_sglang_adapter_builds_awq_launch_command(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(sglang_module, "_runtime_python_exists", lambda _: False)
+    awq_dir = tmp_path / "Qwen3.5-4B-AWQ"
+    awq_dir.mkdir()
+    (awq_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "torch_dtype": "float16",
+                "quantization_config": {"quant_method": "awq", "bits": 4},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = BackendConfig(
+        kind="sglang",
+        base_url="http://127.0.0.1:31002",
+        model_repo_id="Qwen/Qwen3.5-4B",
+        quant_mode="awq_int4",
+        artifact_path=str(awq_dir),
+        mamba_ssm_dtype="float16",
+        disable_cuda_graph=True,
+    )
+    adapter = SGLangBackendAdapter.from_backend_config(config, tmp_path)
+
+    command = adapter._build_launch_command()
+    diagnostics = adapter.diagnostics().to_dict()
+
+    assert command[command.index("--model-path") + 1] == str(awq_dir)
+    assert command[command.index("--quantization") + 1] == "awq"
+    assert command[command.index("--dtype") + 1] == "half"
+    assert command[command.index("--mamba-ssm-dtype") + 1] == "float16"
+    assert "--disable-cuda-graph" in command
+    assert diagnostics["backend_format"] == "sglang_awq_int4"
+    assert diagnostics["mamba_ssm_dtype"] == "float16"
+    assert diagnostics["disable_cuda_graph"] is True
+    assert diagnostics["artifact_summary"]["artifact_kind"] == "local_dir"
+    assert diagnostics["artifact_summary"]["quantization_hint"] == "awq_4bit"
+
+
+def test_sglang_adapter_builds_awq_marlin_launch_command(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(sglang_module, "_runtime_python_exists", lambda _: False)
+    awq_dir = tmp_path / "Qwen3.5-4B-AWQ"
+    awq_dir.mkdir()
+    (awq_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "torch_dtype": "float16",
+                "quantization_config": {
+                    "quant_method": "awq",
+                    "bits": 4,
+                    "group_size": 128,
+                    "zero_point": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = BackendConfig(
+        kind="sglang",
+        base_url="http://127.0.0.1:31012",
+        model_repo_id="Qwen/Qwen3.5-4B",
+        quant_mode="awq_marlin_int4",
+        artifact_path=str(awq_dir),
+        mamba_ssm_dtype="float16",
+        disable_cuda_graph=True,
+    )
+    adapter = SGLangBackendAdapter.from_backend_config(config, tmp_path)
+
+    command = adapter._build_launch_command()
+    diagnostics = adapter.diagnostics().to_dict()
+
+    assert command[command.index("--model-path") + 1] == str(awq_dir)
+    assert command[command.index("--quantization") + 1] == "awq_marlin"
+    assert command[command.index("--dtype") + 1] == "half"
+    assert command[command.index("--mamba-ssm-dtype") + 1] == "float16"
+    assert "--disable-cuda-graph" in command
+    assert diagnostics["backend_format"] == "sglang_awq_marlin_int4"
+    assert diagnostics["quantization"] == "awq_marlin"
+    assert diagnostics["disable_cuda_graph"] is True
+    assert diagnostics["artifact_summary"]["quantization_hint"] == "awq_4bit"
+
+
+def test_sglang_adapter_builds_gguf_launch_command(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(sglang_module, "_runtime_python_exists", lambda _: False)
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="sglang",
+        base_url="http://127.0.0.1:31003",
+        model_repo_id="Qwen/Qwen3.5-4B",
+        quant_mode="gguf_experimental",
+        artifact_path=str(gguf_path),
+        enable_hierarchical_cache=False,
+    )
+    adapter = SGLangBackendAdapter.from_backend_config(config, tmp_path)
+
+    command = adapter._build_launch_command()
+    diagnostics = adapter.diagnostics().to_dict()
+
+    assert command[command.index("--model-path") + 1] == str(gguf_path)
+    assert command[command.index("--load-format") + 1] == "gguf"
+    assert command[command.index("--quantization") + 1] == "gguf"
+    assert "--dtype" not in command
+    assert diagnostics["backend_format"] == "sglang_gguf_experimental"
+    assert diagnostics["artifact_summary"]["artifact_kind"] == "local_file"
+    assert diagnostics["artifact_summary"]["quantization_hint"] == "gguf"
 
 
 def test_sglang_adapter_hicache_and_metrics_calls_use_admin_auth(
@@ -221,6 +340,28 @@ def test_sglang_adapter_surfaces_hicache_incompatibility_for_qwen35(
     assert "hybrid GDN/Mamba" in diagnostics["hicache_blocker"]
 
     with pytest.raises(BackendError, match="HiCache is not supported"):
+        adapter.start_runtime()
+
+
+def test_sglang_adapter_reports_lmstudio_baseline_as_non_runnable(
+    tmp_path: Path, monkeypatch
+):
+    monkeypatch.setattr(sglang_module, "_runtime_python_exists", lambda _: False)
+    config = BackendConfig(
+        kind="sglang",
+        base_url="http://127.0.0.1:31004",
+        model_repo_id="Qwen/Qwen3.5-4B",
+        quant_mode="lmstudio_baseline",
+        model_source="lmstudio_api",
+    )
+    adapter = SGLangBackendAdapter.from_backend_config(config, tmp_path)
+
+    diagnostics = adapter.diagnostics().to_dict()
+
+    assert diagnostics["backend_format"] == "lmstudio_baseline"
+    assert "reporting-only quant_mode" in diagnostics["launcher_cmd_error"]
+
+    with pytest.raises(BackendError, match="reporting-only quant_mode"):
         adapter.start_runtime()
 
 

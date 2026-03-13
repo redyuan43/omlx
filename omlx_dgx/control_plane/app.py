@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -12,8 +12,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from omlx_dgx.config import DGXSettingsManager
-from omlx_dgx.runtime import SGLangBackendAdapter, TensorRTLLMBackendAdapter
+from omlx_dgx.runtime import (
+    AdaptiveBackendAdapter,
+    LlamaCppBackendAdapter,
+    SGLangBackendAdapter,
+    TensorRTLLMBackendAdapter,
+)
 from omlx_dgx.runtime.backend import BackendAdapter, BackendError, HttpOpenAIBackendAdapter
+from omlx_dgx.runtime.adaptive import derive_secondary_base_url
 from omlx_dgx.tiered_kv import PersistentManifestStore
 
 
@@ -86,15 +92,59 @@ def create_app(
     store = manifest_store or PersistentManifestStore(
         Path(config.cache.ssd_root).expanduser().resolve()
     )
+
+    def build_sglang_backend() -> BackendAdapter:
+        backend_config = config.backend
+        if backend_config.prefill_strategy == "adaptive":
+            primary_config = replace(
+                backend_config,
+                chunked_prefill_size=backend_config.adaptive_long_context_chunk_size,
+            )
+            secondary_config = replace(
+                backend_config,
+                base_url=backend_config.adaptive_backend_base_url
+                or derive_secondary_base_url(backend_config.base_url),
+                chunked_prefill_size=backend_config.adaptive_repeat_prefix_chunk_size,
+            )
+            primary = SGLangBackendAdapter.from_backend_config(
+                primary_config,
+                root_path / "adaptive" / "primary",
+            )
+            secondary = SGLangBackendAdapter.from_backend_config(
+                secondary_config,
+                root_path / "adaptive" / "secondary",
+            )
+            return AdaptiveBackendAdapter(
+                primary=primary,
+                secondary=secondary,
+                primary_url=primary_config.base_url,
+                secondary_url=secondary_config.base_url,
+                primary_chunked_prefill_size=primary_config.chunked_prefill_size,
+                secondary_chunked_prefill_size=secondary_config.chunked_prefill_size,
+                short_prompt_threshold=backend_config.adaptive_short_prompt_threshold,
+                max_sticky_sessions=backend_config.adaptive_max_sticky_sessions,
+            )
+
+        fixed_config = replace(
+            backend_config,
+            chunked_prefill_size=backend_config.fixed_chunked_prefill_size,
+        )
+        return SGLangBackendAdapter.from_backend_config(
+            fixed_config,
+            root_path,
+        )
+
     if backend is not None:
         backend_adapter = backend
     elif config.backend.kind == "sglang":
-        backend_adapter = SGLangBackendAdapter.from_backend_config(
+        backend_adapter = build_sglang_backend()
+    elif config.backend.kind == "tensorrt_llm":
+        backend_adapter = TensorRTLLMBackendAdapter.from_backend_config(
             config.backend,
             root_path,
         )
-    elif config.backend.kind == "tensorrt_llm":
-        backend_adapter = TensorRTLLMBackendAdapter.from_backend_config(
+    elif config.backend.kind == "llama_cpp":
+        backend_adapter = LlamaCppBackendAdapter.from_backend_config(
             config.backend,
             root_path,
         )

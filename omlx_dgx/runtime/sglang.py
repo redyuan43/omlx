@@ -72,8 +72,12 @@ def _coerce_response_payload(response) -> Dict[str, Any]:
     }
 
 
-def _latest_model_config_path(model_repo_id: str) -> Optional[Path]:
-    candidate = Path(model_repo_id).expanduser()
+def _latest_model_config_path(model_ref: str) -> Optional[Path]:
+    candidate = Path(model_ref).expanduser()
+    if candidate.is_file():
+        sibling_config = candidate.parent / "config.json"
+        if sibling_config.exists():
+            return sibling_config
     if candidate.is_dir():
         config_path = candidate / "config.json"
         if config_path.exists():
@@ -84,7 +88,7 @@ def _latest_model_config_path(model_repo_id: str) -> Optional[Path]:
         / ".cache"
         / "huggingface"
         / "hub"
-        / f"models--{model_repo_id.replace('/', '--')}"
+        / f"models--{model_ref.replace('/', '--')}"
         / "snapshots"
     )
     if not cache_root.exists():
@@ -98,7 +102,58 @@ def _latest_model_config_path(model_repo_id: str) -> Optional[Path]:
     return configs[0] if configs else None
 
 
-def _inspect_model_traits(model_repo_id: str) -> Dict[str, Any]:
+def _detect_quantization_hint(model_ref: str) -> str:
+    candidate = Path(model_ref).expanduser()
+    if candidate.suffix.lower() == ".gguf":
+        return "gguf"
+
+    config_path = _latest_model_config_path(model_ref)
+    if config_path is not None:
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            config = {}
+        qconfig = config.get("quantization_config", {})
+        quant_method = str(qconfig.get("quant_method", "")).lower()
+        bits = qconfig.get("bits")
+        if quant_method and bits is not None:
+            return f"{quant_method}_{bits}bit"
+        if bits is not None:
+            return f"{bits}bit"
+        torch_dtype = str(config.get("torch_dtype", "")).lower()
+        if torch_dtype in {"bfloat16", "float16", "float32"}:
+            return torch_dtype
+
+    dirname = candidate.name
+    for needle in ("awq", "gptq", "gguf", "bf16", "fp16", "fp32"):
+        if needle in dirname.lower():
+            return needle
+    return "unknown"
+
+
+def _artifact_summary(model_ref: str, *, model_source: str) -> Dict[str, Any]:
+    candidate = Path(model_ref).expanduser()
+    if candidate.exists():
+        if candidate.is_file():
+            artifact_kind = "local_file"
+        elif candidate.is_dir():
+            artifact_kind = "local_dir"
+        else:
+            artifact_kind = "local_other"
+        artifact_exists: Optional[bool] = True
+    else:
+        artifact_kind = "remote_ref"
+        artifact_exists = None
+
+    return {
+        "model_source": model_source,
+        "artifact_exists": artifact_exists,
+        "artifact_kind": artifact_kind,
+        "quantization_hint": _detect_quantization_hint(model_ref),
+    }
+
+
+def _inspect_model_traits(*model_refs: str) -> Dict[str, Any]:
     traits: Dict[str, Any] = {
         "config_path": "",
         "model_type": "",
@@ -106,7 +161,13 @@ def _inspect_model_traits(model_repo_id: str) -> Dict[str, Any]:
         "hicache_supported": None,
         "hicache_blocker": "",
     }
-    config_path = _latest_model_config_path(model_repo_id)
+    config_path = None
+    for model_ref in model_refs:
+        if not model_ref:
+            continue
+        config_path = _latest_model_config_path(model_ref)
+        if config_path is not None:
+            break
     if config_path is None:
         return traits
 
@@ -135,6 +196,7 @@ def _inspect_model_traits(model_repo_id: str) -> Dict[str, Any]:
 @dataclass
 class SGLangDiagnostics:
     adapter: str
+    backend_format: str
     base_url: str
     runtime_python: str
     runtime_python_exists: bool
@@ -143,6 +205,14 @@ class SGLangDiagnostics:
     sglang_package_version: str
     sgl_kernel_package_version: str
     model_repo_id: str
+    quant_mode: str
+    model_source: str
+    artifact_path: str
+    effective_model_path: str
+    load_format: str
+    quantization: str
+    dtype: str
+    artifact_summary: Dict[str, Any]
     model_config_path: str
     model_type: str
     model_architectures: List[str]
@@ -152,7 +222,9 @@ class SGLangDiagnostics:
     chat_template: str
     attention_backend: str
     reasoning_parser: str
+    mamba_ssm_dtype: str
     mem_fraction_static: float
+    disable_cuda_graph: bool
     enable_metrics: bool
     enable_cache_report: bool
     enable_hierarchical_cache: bool
@@ -161,6 +233,7 @@ class SGLangDiagnostics:
     hicache_supported: Optional[bool]
     hicache_blocker: str
     launcher_cmd: str
+    launcher_cmd_error: str
     managed_pid: Optional[int]
     managed_process_running: bool
     startup_timeout_seconds: int
@@ -278,6 +351,41 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
     def _build_hicache_extra_config(self) -> Dict[str, Any]:
         return dict(self.config.hicache_storage_backend_extra_config)
 
+    def _effective_model_path(self) -> str:
+        return self.config.artifact_path or self.config.model_repo_id
+
+    def _load_format(self) -> str:
+        if self.config.quant_mode == "gguf_experimental":
+            return "gguf"
+        return ""
+
+    def _quantization(self) -> str:
+        if self.config.quant_mode == "awq_int4":
+            return "awq"
+        if self.config.quant_mode == "awq_marlin_int4":
+            return "awq_marlin"
+        if self.config.quant_mode == "gguf_experimental":
+            return "gguf"
+        return ""
+
+    def _dtype(self) -> str:
+        if self.config.quant_mode == "bf16":
+            return "bfloat16"
+        if self.config.quant_mode in {"awq_int4", "awq_marlin_int4"}:
+            return "half"
+        return ""
+
+    def _backend_format(self) -> str:
+        if self.config.quant_mode == "awq_int4":
+            return "sglang_awq_int4"
+        if self.config.quant_mode == "awq_marlin_int4":
+            return "sglang_awq_marlin_int4"
+        if self.config.quant_mode == "gguf_experimental":
+            return "sglang_gguf_experimental"
+        if self.config.quant_mode == "lmstudio_baseline":
+            return "lmstudio_baseline"
+        return "sglang_bf16"
+
     def _build_env(self) -> Dict[str, str]:
         env = os.environ.copy()
         if _runtime_python_exists(self.config.runtime_python):
@@ -310,7 +418,13 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
         if self.config.launcher_cmd:
             return shlex.split(self.config.launcher_cmd)
 
-        if not self.config.model_repo_id:
+        model_path = self._effective_model_path()
+        if self.config.quant_mode == "lmstudio_baseline":
+            raise BackendError(
+                "lmstudio_baseline is a reporting-only quant_mode; "
+                "use an HTTP/OpenAI-compatible backend for LM Studio"
+            )
+        if not model_path:
             raise BackendError("model_repo_id is required for SGLang runtime startup")
 
         args = [
@@ -318,7 +432,7 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             "-m",
             "sglang.launch_server",
             "--model-path",
-            self.config.model_repo_id,
+            model_path,
             "--host",
             self.launch_host,
             "--port",
@@ -332,12 +446,25 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             "--mem-fraction-static",
             str(self.config.mem_fraction_static),
         ]
+        load_format = self._load_format()
+        if load_format:
+            args.extend(["--load-format", load_format])
+        quantization = self._quantization()
+        if quantization:
+            args.extend(["--quantization", quantization])
+        dtype = self._dtype()
+        if dtype:
+            args.extend(["--dtype", dtype])
         if self.config.chat_template:
             args.extend(["--chat-template", self.config.chat_template])
         if self.config.attention_backend:
             args.extend(["--attention-backend", self.config.attention_backend])
         if self.config.reasoning_parser:
             args.extend(["--reasoning-parser", self.config.reasoning_parser])
+        if self.config.mamba_ssm_dtype:
+            args.extend(["--mamba-ssm-dtype", self.config.mamba_ssm_dtype])
+        if self.config.disable_cuda_graph:
+            args.append("--disable-cuda-graph")
         if self.config.trust_remote_code:
             args.append("--trust-remote-code")
         if self.config.enable_metrics:
@@ -380,10 +507,21 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
         return args
 
     def diagnostics(self) -> SGLangDiagnostics:
-        command = self._build_launch_command()
-        model_traits = _inspect_model_traits(self.config.model_repo_id)
+        launcher_cmd = ""
+        launcher_cmd_error = ""
+        try:
+            command = self._build_launch_command()
+            launcher_cmd = _stringify_command(command)
+        except BackendError as exc:
+            launcher_cmd_error = str(exc)
+        effective_model_path = self._effective_model_path()
+        model_traits = _inspect_model_traits(
+            effective_model_path,
+            self.config.model_repo_id,
+        )
         return SGLangDiagnostics(
             adapter="sglang",
+            backend_format=self._backend_format(),
             base_url=self.base_url,
             runtime_python=self.config.runtime_python,
             runtime_python_exists=_runtime_python_exists(self.config.runtime_python),
@@ -392,6 +530,17 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             sglang_package_version=self._package_version("sglang"),
             sgl_kernel_package_version=self._package_version("sgl-kernel"),
             model_repo_id=self.config.model_repo_id,
+            quant_mode=self.config.quant_mode,
+            model_source=self.config.model_source,
+            artifact_path=self.config.artifact_path,
+            effective_model_path=effective_model_path,
+            load_format=self._load_format(),
+            quantization=self._quantization(),
+            dtype=self._dtype(),
+            artifact_summary=_artifact_summary(
+                effective_model_path,
+                model_source=self.config.model_source,
+            ),
             model_config_path=model_traits["config_path"],
             model_type=model_traits["model_type"],
             model_architectures=list(model_traits["architectures"]),
@@ -401,7 +550,9 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             chat_template=self.config.chat_template or "",
             attention_backend=self.config.attention_backend,
             reasoning_parser=self.config.reasoning_parser,
+            mamba_ssm_dtype=self.config.mamba_ssm_dtype,
             mem_fraction_static=self.config.mem_fraction_static,
+            disable_cuda_graph=self.config.disable_cuda_graph,
             enable_metrics=self.config.enable_metrics,
             enable_cache_report=self.config.enable_cache_report,
             enable_hierarchical_cache=self.config.enable_hierarchical_cache,
@@ -411,7 +562,8 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             ),
             hicache_supported=model_traits["hicache_supported"],
             hicache_blocker=model_traits["hicache_blocker"],
-            launcher_cmd=_stringify_command(command),
+            launcher_cmd=launcher_cmd,
+            launcher_cmd_error=launcher_cmd_error,
             managed_pid=self.process_manager.pid(),
             managed_process_running=self.process_manager.is_running(),
             startup_timeout_seconds=self.config.startup_timeout_seconds,
@@ -496,6 +648,7 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
         return metrics
 
     def start_runtime(self) -> Dict[str, Any]:
+        command = self._build_launch_command()
         diagnostics = self.diagnostics()
         if (
             self.config.enable_hierarchical_cache
@@ -505,7 +658,6 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
                 f"HiCache is not supported for {self.config.model_repo_id}: "
                 f"{diagnostics.hicache_blocker}. Disable hierarchical cache for this model."
             )
-        command = self._build_launch_command()
         env = self._build_env()
         result = self.process_manager.start(command, env=env)
         if result.get("reason") == "already_running":

@@ -52,9 +52,19 @@
 ## Experimental DGX Path
 
 This repository now also includes an experimental `omlx_dgx` package for
-researching a DGX-oriented runtime around SGLang/HiCache, with TensorRT-LLM kept
-as a research backend. See
-[README.dgx.md](README.dgx.md) for the current scope and launcher.
+researching a DGX-oriented runtime around SGLang/HiCache, TensorRT-LLM, and
+`llama.cpp` GGUF serving. The most mature DGX result in the repo today is
+`Qwen3.5-4B Q4_K_S` on `llama.cpp`, where the control plane adds oMLX-style
+session stickiness so short concurrent requests do not blow away a long
+conversation's warm prefix.
+
+Current measured mixed-traffic result on DGX Spark:
+
+- `omlx_dgx + llama.cpp`: repeated long request `0.097s`, concurrent short request `0.176s`, total mixed makespan `0.192s`
+- `LM Studio`: repeated long request `0.131s`, concurrent short request `0.366s`, total mixed makespan `0.367s`
+
+See [README.dgx.md](README.dgx.md) for the current scope, launcher, and the
+latest benchmark notes.
 
 ### macOS App
 

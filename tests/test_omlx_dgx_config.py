@@ -16,9 +16,39 @@ def test_settings_manager_persists_default_model(tmp_path: Path):
     assert reloaded.config.resolve_model_id(None) == "qwen35-35b"
     assert reloaded.config.backend.kind == "sglang"
     assert reloaded.config.backend.model_repo_id == "Qwen/Qwen3.5-35B-A3B"
+    assert reloaded.config.backend.quant_mode == "bf16"
+    assert reloaded.config.backend.model_source == "hf"
+    assert reloaded.config.backend.artifact_path == ""
+    assert reloaded.config.backend.gguf_variant == ""
+    assert reloaded.config.backend.launcher_binary == "llama-server"
     assert reloaded.config.backend.attention_backend == "triton"
+    assert reloaded.config.backend.mamba_ssm_dtype == ""
     assert reloaded.config.backend.chat_template == ""
+    assert reloaded.config.backend.ctx_size == 16384
+    assert reloaded.config.backend.parallel_slots == 1
+    assert reloaded.config.backend.n_gpu_layers == 999
+    assert reloaded.config.backend.flash_attn is True
+    assert reloaded.config.backend.batch_size == 2048
+    assert reloaded.config.backend.ubatch_size == 512
+    assert reloaded.config.backend.cache_ram_mib == 8192
+    assert reloaded.config.backend.cache_reuse == 0
+    assert reloaded.config.backend.checkpoint_every_n_tokens == 8192
+    assert reloaded.config.backend.ctx_checkpoints == 32
+    assert reloaded.config.backend.slot_prompt_similarity == 0.10
+    assert reloaded.config.backend.enable_runtime_metrics is False
+    assert reloaded.config.backend.enable_session_stickiness is True
+    assert reloaded.config.backend.sticky_session_prompt_threshold == 2048
+    assert reloaded.config.backend.sticky_max_sessions == 256
+    assert reloaded.config.backend.split_mode == "row"
+    assert reloaded.config.backend.no_context_shift is True
+    assert reloaded.config.backend.jinja is True
+    assert reloaded.config.backend.reasoning_format == "deepseek"
+    assert reloaded.config.backend.prefill_strategy == "fixed"
     assert reloaded.config.backend.chunked_prefill_size == 8192
+    assert reloaded.config.backend.fixed_chunked_prefill_size == 8192
+    assert reloaded.config.backend.adaptive_short_prompt_threshold == 2048
+    assert reloaded.config.backend.adaptive_long_context_chunk_size == 8192
+    assert reloaded.config.backend.adaptive_repeat_prefix_chunk_size == 1024
     assert reloaded.config.backend.hicache_storage_backend == "file"
     assert (
         reloaded.config.backend.hicache_storage_backend_extra_config[
@@ -61,8 +91,27 @@ def test_cli_serve_persists_hicache_flags(tmp_path: Path, monkeypatch):
             "Qwen/Qwen3.5-4B",
             "--model-alias",
             "qwen35-4b",
-            "--chunked-prefill-size",
+            "--quant-mode",
+            "awq_int4",
+            "--model-source",
+            "hf",
+            "--artifact-path",
+            "/models/Qwen3.5-4B-AWQ",
+            "--mamba-ssm-dtype",
+            "float16",
+            "--disable-cuda-graph",
+            "--prefill-strategy",
+            "adaptive",
+            "--fixed-chunked-prefill-size",
+            "4096",
+            "--adaptive-short-prompt-threshold",
             "1024",
+            "--adaptive-long-context-chunk-size",
+            "4096",
+            "--adaptive-repeat-prefix-chunk-size",
+            "1024",
+            "--adaptive-backend-url",
+            "http://127.0.0.1:31001",
             "--enable-hierarchical-cache",
             "--hicache-size-gb",
             "8",
@@ -72,7 +121,18 @@ def test_cli_serve_persists_hicache_flags(tmp_path: Path, monkeypatch):
     args.func(args)
 
     reloaded = DGXSettingsManager(tmp_path)
-    assert reloaded.config.backend.chunked_prefill_size == 1024
+    assert reloaded.config.backend.quant_mode == "awq_int4"
+    assert reloaded.config.backend.model_source == "hf"
+    assert reloaded.config.backend.artifact_path == "/models/Qwen3.5-4B-AWQ"
+    assert reloaded.config.backend.mamba_ssm_dtype == "float16"
+    assert reloaded.config.backend.disable_cuda_graph is True
+    assert reloaded.config.backend.prefill_strategy == "adaptive"
+    assert reloaded.config.backend.fixed_chunked_prefill_size == 4096
+    assert reloaded.config.backend.chunked_prefill_size == 4096
+    assert reloaded.config.backend.adaptive_short_prompt_threshold == 1024
+    assert reloaded.config.backend.adaptive_long_context_chunk_size == 4096
+    assert reloaded.config.backend.adaptive_repeat_prefix_chunk_size == 1024
+    assert reloaded.config.backend.adaptive_backend_base_url == "http://127.0.0.1:31001"
     assert reloaded.config.backend.enable_hierarchical_cache is True
     assert reloaded.config.backend.hicache_size == 8
     assert (
@@ -81,3 +141,138 @@ def test_cli_serve_persists_hicache_flags(tmp_path: Path, monkeypatch):
         ]
         is True
     )
+
+
+def test_settings_manager_migrates_legacy_chunked_prefill_size(tmp_path: Path):
+    (tmp_path / "settings.json").write_text(
+        """
+{
+  "backend": {
+    "chunked_prefill_size": 2048
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    reloaded = DGXSettingsManager(tmp_path)
+
+    assert reloaded.config.backend.chunked_prefill_size == 2048
+    assert reloaded.config.backend.fixed_chunked_prefill_size == 2048
+    assert reloaded.config.backend.adaptive_long_context_chunk_size == 2048
+
+
+def test_backend_config_gguf_quant_mode_forces_gguf_source(tmp_path: Path):
+    (tmp_path / "settings.json").write_text(
+        """
+{
+  "backend": {
+    "quant_mode": "gguf_experimental",
+    "model_source": "hf"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    reloaded = DGXSettingsManager(tmp_path)
+
+    assert reloaded.config.backend.quant_mode == "gguf_experimental"
+    assert reloaded.config.backend.model_source == "gguf"
+
+
+def test_cli_serve_persists_llama_cpp_fields(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cli, "create_app", lambda **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "serve",
+            "--base-path",
+            str(tmp_path),
+            "--backend-kind",
+            "llama_cpp",
+            "--model-id",
+            "lmstudio-community/Qwen3.5-4B-GGUF:Q4_K_M",
+            "--model-alias",
+            "qwen35-4b-q4km",
+            "--quant-mode",
+            "gguf_experimental",
+            "--model-source",
+            "gguf",
+            "--artifact-path",
+            "/models/Qwen3.5-4B-Q4_K_M.gguf",
+            "--gguf-variant",
+            "Q4_K_M",
+            "--launcher-binary",
+            "/opt/llama.cpp/bin/llama-server",
+            "--launcher-cmd",
+            "/opt/llama.cpp/bin/llama-server --model /models/Qwen3.5-4B-Q4_K_M.gguf --port 30000",
+            "--ctx-size",
+            "16384",
+            "--parallel-slots",
+            "2",
+            "--n-gpu-layers",
+            "999",
+            "--flash-attn",
+            "--batch-size",
+            "4096",
+            "--ubatch-size",
+            "1024",
+            "--cache-ram-mib",
+            "16384",
+            "--cache-reuse",
+            "256",
+            "--checkpoint-every-n-tokens",
+            "1024",
+            "--ctx-checkpoints",
+            "64",
+            "--slot-prompt-similarity",
+            "0.25",
+            "--enable-runtime-metrics",
+            "--enable-session-stickiness",
+            "--sticky-session-prompt-threshold",
+            "3072",
+            "--sticky-max-sessions",
+            "128",
+            "--split-mode",
+            "row",
+            "--no-context-shift",
+            "--jinja",
+            "--reasoning-format",
+            "deepseek",
+        ]
+    )
+    args.func(args)
+
+    reloaded = DGXSettingsManager(tmp_path)
+    assert reloaded.config.backend.kind == "llama_cpp"
+    assert reloaded.config.backend.quant_mode == "gguf_experimental"
+    assert reloaded.config.backend.model_source == "gguf"
+    assert reloaded.config.backend.artifact_path == "/models/Qwen3.5-4B-Q4_K_M.gguf"
+    assert reloaded.config.backend.gguf_variant == "Q4_K_M"
+    assert reloaded.config.backend.launcher_binary == "/opt/llama.cpp/bin/llama-server"
+    assert (
+        reloaded.config.backend.launcher_cmd
+        == "/opt/llama.cpp/bin/llama-server --model /models/Qwen3.5-4B-Q4_K_M.gguf --port 30000"
+    )
+    assert reloaded.config.backend.ctx_size == 16384
+    assert reloaded.config.backend.parallel_slots == 2
+    assert reloaded.config.backend.n_gpu_layers == 999
+    assert reloaded.config.backend.flash_attn is True
+    assert reloaded.config.backend.batch_size == 4096
+    assert reloaded.config.backend.ubatch_size == 1024
+    assert reloaded.config.backend.cache_ram_mib == 16384
+    assert reloaded.config.backend.cache_reuse == 256
+    assert reloaded.config.backend.checkpoint_every_n_tokens == 1024
+    assert reloaded.config.backend.ctx_checkpoints == 64
+    assert reloaded.config.backend.slot_prompt_similarity == 0.25
+    assert reloaded.config.backend.enable_runtime_metrics is True
+    assert reloaded.config.backend.enable_session_stickiness is True
+    assert reloaded.config.backend.sticky_session_prompt_threshold == 3072
+    assert reloaded.config.backend.sticky_max_sessions == 128
+    assert reloaded.config.backend.split_mode == "row"
+    assert reloaded.config.backend.no_context_shift is True
+    assert reloaded.config.backend.jinja is True
+    assert reloaded.config.backend.reasoning_format == "deepseek"
