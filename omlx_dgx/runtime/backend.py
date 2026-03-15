@@ -8,6 +8,7 @@ import io
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import requests
@@ -22,6 +23,23 @@ def _parse_optional_int(value: str) -> Optional[int]:
     if not value or value in {"[N/A]", "N/A"}:
         return None
     return int(value)
+
+
+def _read_system_memory_kb() -> Dict[str, int]:
+    keys = {"MemTotal", "MemAvailable", "SwapTotal", "SwapFree"}
+    values: Dict[str, int] = {}
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        return values
+    for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+        name, _, raw_value = line.partition(":")
+        if name not in keys:
+            continue
+        try:
+            values[name] = int(raw_value.strip().split()[0])
+        except (IndexError, ValueError):
+            continue
+    return values
 
 
 @dataclass
@@ -120,6 +138,12 @@ class HttpOpenAIBackendAdapter(BackendAdapter):
 
     def collect_metrics(self) -> RuntimeMetrics:
         metrics = RuntimeMetrics(backend_url=self.base_url, healthy=self.health())
+        telemetry: Dict[str, Any] = {
+            "gpu_metrics_source": "nvidia-smi",
+            "gpu_metrics_ok": False,
+            "gpu_metrics_error": None,
+            "system_memory_kb": _read_system_memory_kb(),
+        }
         try:
             result = subprocess.run(
                 [
@@ -139,6 +163,14 @@ class HttpOpenAIBackendAdapter(BackendAdapter):
                 metrics.gpu_memory_total_mb = _parse_optional_int(row[2])
                 metrics.gpu_util_percent = _parse_optional_int(row[3])
                 metrics.gpu_temperature_c = _parse_optional_int(row[4])
-        except Exception:
-            pass
+                telemetry["gpu_metrics_ok"] = True
+        except FileNotFoundError as exc:
+            telemetry["gpu_metrics_error"] = str(exc)
+        except subprocess.CalledProcessError as exc:
+            telemetry["gpu_metrics_error"] = (
+                exc.stderr.strip() or exc.stdout.strip() or str(exc)
+            )
+        except Exception as exc:
+            telemetry["gpu_metrics_error"] = str(exc)
+        metrics.details = {"telemetry": telemetry}
         return metrics

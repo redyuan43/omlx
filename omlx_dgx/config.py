@@ -26,6 +26,108 @@ def parse_size(size_str: str) -> int:
     return int(normalized)
 
 
+LLAMA_CPP_SERVING_PRESETS: Dict[str, Dict[str, Any]] = {
+    "single_session_low_latency": {
+        "ctx_size": 32768,
+        "parallel_slots": 1,
+        "batch_size": 8192,
+        "ubatch_size": 2048,
+        "cache_ram_mib": 16384,
+        "cache_reuse": 256,
+        "checkpoint_every_n_tokens": 1024,
+        "ctx_checkpoints": 64,
+        "slot_prompt_similarity": 0.10,
+        "enable_runtime_metrics": True,
+        "enable_session_stickiness": True,
+        "sticky_session_prompt_threshold": 2048,
+        "sticky_max_sessions": 256,
+        "split_mode": "row",
+        "no_context_shift": True,
+        "jinja": True,
+        "reasoning_format": "deepseek",
+    },
+    "mixed_traffic": {
+        "ctx_size": 32768,
+        "parallel_slots": 2,
+        "batch_size": 8192,
+        "ubatch_size": 2048,
+        "cache_ram_mib": 16384,
+        "cache_reuse": 256,
+        "checkpoint_every_n_tokens": 1024,
+        "ctx_checkpoints": 64,
+        "slot_prompt_similarity": 0.10,
+        "enable_runtime_metrics": True,
+        "enable_session_stickiness": True,
+        "sticky_session_prompt_threshold": 2048,
+        "sticky_max_sessions": 256,
+        "split_mode": "row",
+        "no_context_shift": True,
+        "jinja": True,
+        "reasoning_format": "deepseek",
+    },
+}
+
+RECOMMENDED_LLAMA_CPP_GGUF_MODEL_REPO_ID = "lmstudio-community/Qwen3.5-4B-GGUF:Q4_K_M"
+RECOMMENDED_LLAMA_CPP_GGUF_VARIANT = "Q4_K_M"
+
+
+_LEGACY_LLAMA_CPP_DEFAULTS: Dict[str, Any] = {
+    "ctx_size": 16384,
+    "parallel_slots": 1,
+    "batch_size": 2048,
+    "ubatch_size": 512,
+    "cache_ram_mib": 8192,
+    "cache_reuse": 0,
+    "checkpoint_every_n_tokens": 8192,
+    "ctx_checkpoints": 32,
+    "enable_runtime_metrics": False,
+    "enable_session_stickiness": True,
+    "sticky_session_prompt_threshold": 2048,
+    "sticky_max_sessions": 256,
+    "split_mode": "row",
+    "no_context_shift": True,
+    "jinja": True,
+    "reasoning_format": "deepseek",
+}
+
+
+def apply_llama_cpp_serving_preset(
+    config: "BackendConfig",
+    preset_name: str,
+) -> None:
+    """Apply a named llama.cpp preset to a backend config."""
+    values = LLAMA_CPP_SERVING_PRESETS.get(preset_name)
+    if values is None:
+        raise ValueError(f"unknown llama.cpp serving preset: {preset_name}")
+    for field_name, field_value in values.items():
+        setattr(config, field_name, field_value)
+    config.serving_preset = preset_name
+
+
+def should_auto_upgrade_llama_cpp_defaults(config: "BackendConfig") -> bool:
+    """Detect the pre-preset llama.cpp defaults used by earlier revisions."""
+    if config.kind != "llama_cpp" or config.serving_preset:
+        return False
+    for field_name, expected_value in _LEGACY_LLAMA_CPP_DEFAULTS.items():
+        if getattr(config, field_name) != expected_value:
+            return False
+    return True
+
+
+def apply_llama_cpp_default_model_selection(config: "BackendConfig") -> None:
+    """Pick the default GGUF variant for llama.cpp when the user did not choose one."""
+    if config.kind != "llama_cpp" or config.quant_mode != "gguf_experimental":
+        return
+    is_unset_model_ref = (
+        not config.artifact_path
+        and (not config.model_repo_id or config.model_repo_id == "Qwen/Qwen3.5-35B-A3B")
+    )
+    if not config.gguf_variant and is_unset_model_ref:
+        config.gguf_variant = RECOMMENDED_LLAMA_CPP_GGUF_VARIANT
+    if is_unset_model_ref:
+        config.model_repo_id = RECOMMENDED_LLAMA_CPP_GGUF_MODEL_REPO_ID
+
+
 @dataclass
 class BackendConfig:
     kind: str = "sglang"
@@ -39,6 +141,7 @@ class BackendConfig:
     model_source: str = "hf"
     artifact_path: str = ""
     gguf_variant: str = ""
+    serving_preset: str = ""
     launcher_cmd: str = ""
     runtime_python: str = "python3"
     startup_timeout_seconds: int = 120
@@ -119,6 +222,11 @@ class BackendConfig:
             self.model_source = "gguf"
         elif self.quant_mode == "lmstudio_baseline" and self.model_source == "hf":
             self.model_source = "lmstudio_api"
+        if self.serving_preset and self.serving_preset not in LLAMA_CPP_SERVING_PRESETS:
+            self.serving_preset = ""
+        if should_auto_upgrade_llama_cpp_defaults(self):
+            apply_llama_cpp_serving_preset(self, "single_session_low_latency")
+        apply_llama_cpp_default_model_selection(self)
         if not self.fixed_chunked_prefill_size:
             self.fixed_chunked_prefill_size = self.chunked_prefill_size or 8192
         if not self.chunked_prefill_size:

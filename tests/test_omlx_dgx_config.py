@@ -3,7 +3,12 @@
 from pathlib import Path
 
 import omlx_dgx.cli as cli
-from omlx_dgx.config import DGXSettingsManager, ModelProfile
+from omlx_dgx.config import (
+    DGXSettingsManager,
+    ModelProfile,
+    RECOMMENDED_LLAMA_CPP_GGUF_MODEL_REPO_ID,
+    RECOMMENDED_LLAMA_CPP_GGUF_VARIANT,
+)
 from omlx_dgx.tiered_kv import PersistentManifestStore, StoredBlockRecord
 
 
@@ -181,6 +186,26 @@ def test_backend_config_gguf_quant_mode_forces_gguf_source(tmp_path: Path):
     assert reloaded.config.backend.model_source == "gguf"
 
 
+def test_backend_config_applies_recommended_llama_cpp_gguf_defaults(tmp_path: Path):
+    (tmp_path / "settings.json").write_text(
+        """
+{
+  "backend": {
+    "kind": "llama_cpp",
+    "quant_mode": "gguf_experimental"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    reloaded = DGXSettingsManager(tmp_path)
+
+    assert reloaded.config.backend.model_source == "gguf"
+    assert reloaded.config.backend.gguf_variant == RECOMMENDED_LLAMA_CPP_GGUF_VARIANT
+    assert reloaded.config.backend.model_repo_id == RECOMMENDED_LLAMA_CPP_GGUF_MODEL_REPO_ID
+
+
 def test_cli_serve_persists_llama_cpp_fields(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(cli, "create_app", lambda **kwargs: object())
     monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
@@ -276,3 +301,72 @@ def test_cli_serve_persists_llama_cpp_fields(tmp_path: Path, monkeypatch):
     assert reloaded.config.backend.no_context_shift is True
     assert reloaded.config.backend.jinja is True
     assert reloaded.config.backend.reasoning_format == "deepseek"
+
+
+def test_cli_serve_applies_llama_cpp_single_session_preset(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(cli, "create_app", lambda **kwargs: object())
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *args, **kwargs: None)
+
+    parser = cli.build_parser()
+    args = parser.parse_args(
+        [
+            "serve",
+            "--base-path",
+            str(tmp_path),
+            "--backend-kind",
+            "llama_cpp",
+            "--model-id",
+            "lmstudio-community/Qwen3.5-4B-GGUF:Q4_K_S",
+            "--model-alias",
+            "qwen35-4b",
+            "--quant-mode",
+            "gguf_experimental",
+            "--model-source",
+            "gguf",
+            "--artifact-path",
+            "/models/Qwen3.5-4B-Q4_K_S.gguf",
+            "--serving-preset",
+            "single_session_low_latency",
+        ]
+    )
+    args.func(args)
+
+    reloaded = DGXSettingsManager(tmp_path)
+    assert reloaded.config.backend.serving_preset == "single_session_low_latency"
+    assert reloaded.config.backend.ctx_size == 32768
+    assert reloaded.config.backend.parallel_slots == 1
+    assert reloaded.config.backend.batch_size == 8192
+    assert reloaded.config.backend.ubatch_size == 2048
+    assert reloaded.config.backend.cache_ram_mib == 16384
+    assert reloaded.config.backend.cache_reuse == 256
+    assert reloaded.config.backend.checkpoint_every_n_tokens == 1024
+    assert reloaded.config.backend.ctx_checkpoints == 64
+    assert reloaded.config.backend.enable_runtime_metrics is True
+
+
+def test_settings_manager_auto_upgrades_legacy_llama_cpp_defaults(tmp_path: Path):
+    (tmp_path / "settings.json").write_text(
+        """
+{
+  "backend": {
+    "kind": "llama_cpp",
+    "quant_mode": "gguf_experimental",
+    "model_source": "gguf",
+    "artifact_path": "/models/Qwen3.5-4B-Q4_K_S.gguf"
+  }
+}
+""".strip(),
+        encoding="utf-8",
+    )
+
+    reloaded = DGXSettingsManager(tmp_path)
+
+    assert reloaded.config.backend.serving_preset == "single_session_low_latency"
+    assert reloaded.config.backend.ctx_size == 32768
+    assert reloaded.config.backend.parallel_slots == 1
+    assert reloaded.config.backend.batch_size == 8192
+    assert reloaded.config.backend.ubatch_size == 2048
+    assert reloaded.config.backend.cache_ram_mib == 16384
+    assert reloaded.config.backend.cache_reuse == 256
+    assert reloaded.config.backend.checkpoint_every_n_tokens == 1024
+    assert reloaded.config.backend.ctx_checkpoints == 64

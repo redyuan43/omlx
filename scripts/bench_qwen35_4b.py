@@ -84,6 +84,7 @@ def _runtime_summary(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
     backend = runtime_payload.get("backend", {})
     details = backend.get("details", {})
     diagnostics = details.get("diagnostics", {})
+    telemetry = details.get("telemetry", {})
     config_backend = runtime_payload.get("config", {}).get("backend", {})
     routing = details.get("routing", {})
     props = details.get("props", {})
@@ -139,6 +140,8 @@ def _runtime_summary(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
         or props.get("model_path")
         or server_info.get("model_path"),
         "artifact_summary": diagnostics.get("artifact_summary"),
+        "serving_preset": diagnostics.get("serving_preset")
+        or config_backend.get("serving_preset"),
         "gguf_variant": diagnostics.get("gguf_variant")
         or (diagnostics.get("artifact_summary") or {}).get("gguf_variant"),
         "chunked_prefill_size": state.get(
@@ -164,6 +167,12 @@ def _runtime_summary(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
         "enable_session_stickiness": diagnostics.get("enable_session_stickiness")
         if diagnostics.get("enable_session_stickiness") is not None
         else config_backend.get("enable_session_stickiness"),
+        "single_session_continuation_enabled": diagnostics.get(
+            "single_session_continuation_enabled"
+        ),
+        "single_session_continuation_ttl_seconds": diagnostics.get(
+            "single_session_continuation_ttl_seconds"
+        ),
         "sticky_session_prompt_threshold": diagnostics.get("sticky_session_prompt_threshold")
         or config_backend.get("sticky_session_prompt_threshold"),
         "sticky_max_sessions": diagnostics.get("sticky_max_sessions")
@@ -179,11 +188,13 @@ def _runtime_summary(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
             "disable_chunked_prefix_cache", server_info.get("disable_chunked_prefix_cache")
         ),
         "memory_usage": _runtime_memory_usage(runtime_payload),
+        "telemetry": telemetry,
         "prefill_strategy": runtime_payload.get("config", {})
         .get("backend", {})
         .get("prefill_strategy", "fixed"),
         "routing_profiles": routing.get("profiles"),
         "last_route": routing.get("last_decision"),
+        "continuation": details.get("continuation"),
     }
 
 
@@ -222,6 +233,7 @@ def _run_case(
     prompt: str,
     max_tokens: int,
     disable_thinking: bool,
+    llama_cpp_reasoning_compat: bool = False,
     conversation_id: str | None = None,
 ) -> Dict[str, Any]:
     before = _snapshot(control_plane_url, runtime_url)
@@ -235,6 +247,12 @@ def _run_case(
         payload["metadata"] = {"conversation_id": conversation_id}
     if disable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if llama_cpp_reasoning_compat:
+            payload["enableThinking"] = False
+            payload["reasoning"] = False
+            payload["reasoning_budget"] = 0
+            payload["reasoning_format"] = "none"
+            payload["thinking_forced_open"] = False
 
     started = time.perf_counter()
     try:
@@ -254,6 +272,13 @@ def _run_case(
     after = _snapshot(control_plane_url, runtime_url)
 
     if response is None:
+        continuation_after = (
+            after["runtime"]
+            .get("backend", {})
+            .get("details", {})
+            .get("continuation", {})
+            .get("last_decision")
+        )
         return {
             "wall_time_sec": round(wall_time, 3),
             "ttft_sec": None,
@@ -285,6 +310,13 @@ def _run_case(
                 .get("slot_router", {})
                 .get("last_decision")
             ),
+            "continuation_after": continuation_after,
+            "continuation_hit": (
+                None if continuation_after is None else continuation_after.get("continuation_hit")
+            ),
+            "prefix_drift": (
+                None if continuation_after is None else continuation_after.get("prefix_drift")
+            ),
         }
 
     usage = response.get("usage", {})
@@ -309,6 +341,13 @@ def _run_case(
     if completion_tokens and e2e is not None and ttft is not None and e2e > ttft:
         decode_window = e2e - ttft
         decode_token_per_second = completion_tokens / decode_window
+    continuation_after = (
+        after["runtime"]
+        .get("backend", {})
+        .get("details", {})
+        .get("continuation", {})
+        .get("last_decision")
+    )
 
     return {
         "wall_time_sec": round(wall_time, 3),
@@ -347,6 +386,13 @@ def _run_case(
             .get("slot_router", {})
             .get("last_decision")
         ),
+        "continuation_after": continuation_after,
+        "continuation_hit": (
+            None if continuation_after is None else continuation_after.get("continuation_hit")
+        ),
+        "prefix_drift": (
+            None if continuation_after is None else continuation_after.get("prefix_drift")
+        ),
     }
 
 
@@ -358,6 +404,7 @@ def _run_messages_case(
     messages: list[Dict[str, Any]],
     max_tokens: int,
     disable_thinking: bool,
+    llama_cpp_reasoning_compat: bool = False,
     conversation_id: str | None = None,
 ) -> Dict[str, Any]:
     before = _snapshot(control_plane_url, runtime_url)
@@ -371,6 +418,12 @@ def _run_messages_case(
         payload["metadata"] = {"conversation_id": conversation_id}
     if disable_thinking:
         payload["chat_template_kwargs"] = {"enable_thinking": False}
+        if llama_cpp_reasoning_compat:
+            payload["enableThinking"] = False
+            payload["reasoning"] = False
+            payload["reasoning_budget"] = 0
+            payload["reasoning_format"] = "none"
+            payload["thinking_forced_open"] = False
 
     started = time.perf_counter()
     response = _http_json(
@@ -382,6 +435,13 @@ def _run_messages_case(
     after = _snapshot(control_plane_url, runtime_url)
     usage = response.get("usage", {})
     completion_tokens = usage.get("completion_tokens", 0) or 0
+    continuation_after = (
+        after["runtime"]
+        .get("backend", {})
+        .get("details", {})
+        .get("continuation", {})
+        .get("last_decision")
+    )
     return {
         "wall_time_sec": round(wall_time, 3),
         "token_per_second": (
@@ -412,6 +472,93 @@ def _run_messages_case(
             .get("slot_router", {})
             .get("last_decision")
         ),
+        "continuation_after": continuation_after,
+        "continuation_hit": (
+            None if continuation_after is None else continuation_after.get("continuation_hit")
+        ),
+        "prefix_drift": (
+            None if continuation_after is None else continuation_after.get("prefix_drift")
+        ),
+    }
+
+
+def _run_single_session_followup(
+    *,
+    control_plane_url: str,
+    runtime_url: str,
+    model: str,
+    long_prompt: str,
+    disable_thinking: bool,
+    llama_cpp_reasoning_compat: bool,
+    conversation_id: str,
+) -> Dict[str, Any]:
+    turn1_messages = [
+        {
+            "role": "user",
+            "content": f"{long_prompt}\n\nExplain in one short sentence why reusing context matters.",
+        }
+    ]
+    turn1 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn1_messages,
+        max_tokens=24,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+    turn2_messages = turn1_messages + [
+        turn1["assistant"],
+        {"role": "user", "content": "Now answer with exactly one word: benefit?"},
+    ]
+    turn2 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn2_messages,
+        max_tokens=8,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+    turn3_messages = turn2_messages + [
+        turn2["assistant"],
+        {"role": "user", "content": "Again, one different word only."},
+    ]
+    turn3 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn3_messages,
+        max_tokens=8,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+    turn2_prompt_tokens = (turn2.get("usage") or {}).get("prompt_tokens")
+    turn3_prompt_tokens = (turn3.get("usage") or {}).get("prompt_tokens")
+    followup_avg = None
+    if turn2.get("wall_time_sec") is not None and turn3.get("wall_time_sec") is not None:
+        followup_avg = round((turn2["wall_time_sec"] + turn3["wall_time_sec"]) / 2, 3)
+    return {
+        "turn1_long": turn1,
+        "turn2_short_followup": turn2,
+        "turn3_short_followup": turn3,
+        "summary": {
+            "turn1_long_sec": turn1.get("wall_time_sec"),
+            "turn2_short_followup_sec": turn2.get("wall_time_sec"),
+            "turn3_short_followup_sec": turn3.get("wall_time_sec"),
+            "turn2_prompt_tokens": turn2_prompt_tokens,
+            "turn3_prompt_tokens": turn3_prompt_tokens,
+            "turn2_continuation_hit": turn2.get("continuation_hit"),
+            "turn3_continuation_hit": turn3.get("continuation_hit"),
+            "turn2_prefix_drift": turn2.get("prefix_drift"),
+            "turn3_prefix_drift": turn3.get("prefix_drift"),
+            "followup_avg_sec": followup_avg,
+            "slot_after": turn3.get("slot_after"),
+            "continuation_after": turn3.get("continuation_after"),
+        },
     }
 
 
@@ -461,10 +608,12 @@ def main() -> None:
         raise SystemExit(f"control plane unavailable: {exc}") from exc
 
     initial_runtime = _http_json(f"{args.control_plane_url}/admin/api/runtime")
+    runtime_summary = _runtime_summary(initial_runtime)
+    llama_cpp_reasoning_compat = runtime_summary.get("backend_format") == "llama_cpp_gguf"
 
     results = {
         "health": health,
-        "runtime_summary": _runtime_summary(initial_runtime),
+        "runtime_summary": runtime_summary,
         "short_chat": _run_case(
             control_plane_url=args.control_plane_url,
             runtime_url=args.runtime_url,
@@ -472,6 +621,7 @@ def main() -> None:
             prompt=short_prompt,
             max_tokens=16,
             disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-short-chat",
         ),
         "long_output_chat": _run_case(
@@ -481,6 +631,7 @@ def main() -> None:
             prompt=long_output_prompt,
             max_tokens=args.long_output_max_tokens,
             disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-long-output",
         ),
         "long_prefix_run_1": _run_case(
@@ -490,6 +641,7 @@ def main() -> None:
             prompt=long_prompt,
             max_tokens=4,
             disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-repeat-long-prefix",
         ),
         "long_prefix_run_2": _run_case(
@@ -499,6 +651,7 @@ def main() -> None:
             prompt=long_prompt,
             max_tokens=4,
             disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-repeat-long-prefix",
         ),
         "multi_turn_chat": _run_messages_case(
@@ -508,7 +661,17 @@ def main() -> None:
             messages=multi_turn_messages,
             max_tokens=64,
             disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-multi-turn",
+        ),
+        "single_session_followup": _run_single_session_followup(
+            control_plane_url=args.control_plane_url,
+            runtime_url=args.runtime_url,
+            model=args.model,
+            long_prompt=long_prefix,
+            disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+            conversation_id="bench-single-session-followup",
         ),
     }
 

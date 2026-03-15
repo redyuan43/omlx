@@ -8,7 +8,12 @@ from pathlib import Path
 
 import uvicorn
 
-from omlx_dgx.config import DGXSettingsManager, ModelProfile
+from omlx_dgx.config import (
+    LLAMA_CPP_SERVING_PRESETS,
+    DGXSettingsManager,
+    ModelProfile,
+    apply_llama_cpp_serving_preset,
+)
 from omlx_dgx.control_plane.app import create_app
 
 
@@ -40,6 +45,8 @@ def serve_command(args: argparse.Namespace) -> None:
         settings.config.backend.artifact_path = args.artifact_path
     if args.gguf_variant is not None:
         settings.config.backend.gguf_variant = args.gguf_variant
+    if args.serving_preset is not None:
+        apply_llama_cpp_serving_preset(settings.config.backend, args.serving_preset)
     if args.ctx_size is not None:
         settings.config.backend.ctx_size = args.ctx_size
     if args.parallel_slots is not None:
@@ -172,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument("--artifact-path", default=None)
     serve.add_argument("--gguf-variant", default=None)
+    serve.add_argument(
+        "--serving-preset",
+        choices=tuple(sorted(LLAMA_CPP_SERVING_PRESETS)),
+        default=None,
+    )
     serve.add_argument("--ctx-size", type=int, default=None)
     serve.add_argument("--parallel-slots", type=int, default=None)
     serve.add_argument("--n-gpu-layers", type=int, default=None)

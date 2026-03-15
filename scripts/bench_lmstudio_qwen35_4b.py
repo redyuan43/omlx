@@ -142,6 +142,60 @@ def _run_messages_case(
     }
 
 
+def _run_single_session_followup(
+    *,
+    lmstudio_url: str,
+    model: str,
+    long_prompt: str,
+) -> Dict[str, Any]:
+    turn1_messages = [
+        {
+            "role": "user",
+            "content": f"{long_prompt}\n\nExplain in one short sentence why reusing context matters.",
+        }
+    ]
+    turn1 = _run_messages_case(
+        lmstudio_url=lmstudio_url,
+        model=model,
+        messages=turn1_messages,
+        max_tokens=24,
+    )
+    turn2_messages = turn1_messages + [
+        turn1["assistant"],
+        {"role": "user", "content": "Now answer with exactly one word: benefit?"},
+    ]
+    turn2 = _run_messages_case(
+        lmstudio_url=lmstudio_url,
+        model=model,
+        messages=turn2_messages,
+        max_tokens=8,
+    )
+    turn3_messages = turn2_messages + [
+        turn2["assistant"],
+        {"role": "user", "content": "Again, one different word only."},
+    ]
+    turn3 = _run_messages_case(
+        lmstudio_url=lmstudio_url,
+        model=model,
+        messages=turn3_messages,
+        max_tokens=8,
+    )
+    followup_avg = round((turn2["wall_time_sec"] + turn3["wall_time_sec"]) / 2, 3)
+    return {
+        "turn1_long": turn1,
+        "turn2_short_followup": turn2,
+        "turn3_short_followup": turn3,
+        "summary": {
+            "turn1_long_sec": turn1.get("wall_time_sec"),
+            "turn2_short_followup_sec": turn2.get("wall_time_sec"),
+            "turn3_short_followup_sec": turn3.get("wall_time_sec"),
+            "turn2_prompt_tokens": (turn2.get("usage") or {}).get("prompt_tokens"),
+            "turn3_prompt_tokens": (turn3.get("usage") or {}).get("prompt_tokens"),
+            "followup_avg_sec": followup_avg,
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark LM Studio Qwen3.5-4B GGUF")
     parser.add_argument("--lmstudio-url", default="http://127.0.0.1:1234")
@@ -214,6 +268,11 @@ def main() -> None:
             model=args.model,
             messages=multi_turn_messages,
             max_tokens=64,
+        ),
+        "single_session_followup": _run_single_session_followup(
+            lmstudio_url=args.lmstudio_url,
+            model=args.model,
+            long_prompt=long_prefix,
         ),
     }
     print(json.dumps(results, indent=2, ensure_ascii=False))

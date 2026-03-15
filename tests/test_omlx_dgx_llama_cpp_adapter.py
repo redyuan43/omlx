@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import subprocess
 from pathlib import Path
 
+import omlx_dgx.runtime.backend as backend_module
 from omlx_dgx.config import BackendConfig
 from omlx_dgx.runtime.llama_cpp import LlamaCppBackendAdapter
 
@@ -100,6 +102,8 @@ def test_llama_cpp_adapter_builds_local_gguf_launch_command(tmp_path: Path):
     assert diagnostics["cache_reuse"] == 256
     assert diagnostics["enable_session_stickiness"] is True
     assert diagnostics["sticky_session_prompt_threshold"] == 2048
+    assert diagnostics["single_session_continuation_enabled"] is False
+    assert diagnostics["single_session_continuation_ttl_seconds"] == 600
 
 
 def test_llama_cpp_adapter_uses_hf_flag_for_remote_gguf_reference(tmp_path: Path):
@@ -174,10 +178,63 @@ def test_llama_cpp_adapter_collects_props_and_slots(tmp_path: Path):
     assert metrics["details"]["props"]["default_generation_settings"]["n_ctx"] == 16384
     assert metrics["details"]["slots"]["slots"][0]["state"] == "idle"
     assert metrics["details"]["slot_router"]["slot_summary"][0]["id"] == 0
+    assert metrics["details"]["continuation"]["enabled"] is True
     assert metrics["details"]["metrics_excerpt"][0] == "# HELP llama_tokens tokens"
+    assert metrics["details"]["telemetry"]["gpu_metrics_source"] == "nvidia-smi"
     assert cache_report["props"]["model_path"] == str(gguf_path)
     assert cache_report["slots"]["slots"][0]["id"] == 0
     assert cache_report["slot_router"]["slot_summary"][0]["id"] == 0
+    assert cache_report["continuation"]["ttl_seconds"] == 600
+
+
+def test_llama_cpp_adapter_surfaces_nvml_errors_in_telemetry(tmp_path: Path, monkeypatch):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q6_K.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32118",
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        artifact_path=str(gguf_path),
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        if path == "health":
+            return FakeResponse(status_code=404, text="not found")
+        if path == "v1/models":
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path == "props":
+            return FakeResponse(
+                json_data={"default_generation_settings": {"n_ctx": 32768}},
+                headers={"content-type": "application/json"},
+            )
+        if path == "slots":
+            return FakeResponse(
+                json_data={"slots": [{"id": 0, "state": "idle"}]},
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(
+            returncode=1,
+            cmd=["nvidia-smi"],
+            stderr="Failed to initialize NVML: Unknown Error",
+        )
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+    monkeypatch.setattr(backend_module.subprocess, "run", fake_run)
+
+    metrics = adapter.collect_metrics().to_dict()
+    telemetry = metrics["details"]["telemetry"]
+
+    assert telemetry["gpu_metrics_ok"] is False
+    assert "Unknown Error" in telemetry["gpu_metrics_error"]
+    assert "MemTotal" in telemetry["system_memory_kb"]
 
 
 def test_llama_cpp_adapter_uses_explicit_launcher_cmd(tmp_path: Path):
@@ -260,6 +317,504 @@ def test_llama_cpp_adapter_assigns_sticky_slot_for_long_session(tmp_path: Path):
     assert second_payload["id_slot"] == 0
     assert metrics["details"]["slot_router"]["last_decision"]["reason"] == "sticky_existing"
     assert metrics["details"]["slot_router"]["bindings"][0]["slot_id"] == 0
+
+
+def test_llama_cpp_adapter_single_slot_continuation_hits_followup(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32109",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    first_payload = {
+        "model": "qwen35-4b-gguf",
+        "messages": [{"role": "user", "content": "prefix " * 64}],
+        "metadata": {"conversation_id": "session-a"},
+    }
+    second_payload = {
+        "model": "qwen35-4b-gguf",
+        "messages": [
+            {"role": "user", "content": "prefix " * 64},
+            {"role": "assistant", "content": "OK"},
+            {"role": "user", "content": "benefit?"},
+        ],
+        "metadata": {"conversation_id": "session-a"},
+    }
+
+    adapter.proxy("POST", "v1/chat/completions", json=first_payload)
+    adapter.proxy("POST", "v1/chat/completions", json=second_payload)
+
+    request_calls = [call for call in calls if call[1] == "v1/chat/completions"]
+    assert request_calls[0][2]["json"]["id_slot"] == 0
+    assert request_calls[1][2]["json"]["id_slot"] == 0
+    assert request_calls[1][2]["json"]["messages"] == [
+        {"role": "assistant", "content": "OK"},
+        {"role": "user", "content": "benefit?"},
+    ]
+
+    metrics = adapter.collect_metrics().to_dict()
+    continuation = metrics["details"]["continuation"]
+
+    assert continuation["last_decision"]["reason"] == "hit"
+    assert continuation["last_decision"]["continuation_hit"] is True
+    assert continuation["last_decision"]["suffix_only"] is True
+    assert continuation["state"]["slot_id"] == 0
+    assert continuation["state"]["message_count"] == 3
+    assert continuation["state"]["slot_message_count"] == 4
+
+
+def test_llama_cpp_adapter_single_slot_prefix_drift_forces_cold_restart(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32110",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "prefix A " * 64}],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "prefix B " * 64}],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+
+    request_calls = [call for call in calls if call[1] == "v1/chat/completions"]
+    assert request_calls[1][2]["json"]["id_slot"] == 0
+
+    metrics = adapter.collect_metrics().to_dict()
+    continuation = metrics["details"]["continuation"]
+
+    assert continuation["last_decision"]["reason"] == "prefix_drift"
+    assert continuation["last_decision"]["prefix_drift"] is True
+    assert continuation["last_decision"]["continuation_hit"] is False
+
+
+def test_llama_cpp_adapter_single_slot_without_conversation_id_passes_through(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32111",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={"model": "qwen35-4b-gguf", "messages": [{"role": "user", "content": "ping"}]},
+    )
+
+    request_payload = [call for call in calls if call[1] == "v1/chat/completions"][0][2]["json"]
+    metrics = adapter.collect_metrics().to_dict()
+    continuation = metrics["details"]["continuation"]
+
+    assert "id_slot" not in request_payload
+    assert continuation["last_decision"]["reason"] == "no_conversation_id"
+
+
+def test_llama_cpp_adapter_single_slot_repeat_prompt_keeps_full_messages(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32112",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    payload = {
+        "model": "qwen35-4b-gguf",
+        "messages": [{"role": "user", "content": "prefix " * 64}],
+        "metadata": {"conversation_id": "session-a"},
+    }
+    adapter.proxy("POST", "v1/chat/completions", json=payload)
+    adapter.proxy("POST", "v1/chat/completions", json=payload)
+
+    request_calls = [call for call in calls if call[1] == "v1/chat/completions"]
+    second_payload = request_calls[1][2]["json"]
+    metrics = adapter.collect_metrics().to_dict()
+
+    assert second_payload["messages"] == payload["messages"]
+    assert metrics["details"]["continuation"]["last_decision"]["suffix_only"] is False
+
+
+def test_llama_cpp_adapter_single_slot_followup_keeps_last_turn_anchor(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32117",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+    replies = iter(["turn1", "turn2", "turn3"])
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": next(replies),
+                            }
+                        }
+                    ],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "prefix"}],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [
+                {"role": "user", "content": "prefix"},
+                {"role": "assistant", "content": "turn1"},
+                {"role": "user", "content": "benefit?"},
+            ],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [
+                {"role": "user", "content": "prefix"},
+                {"role": "assistant", "content": "turn1"},
+                {"role": "user", "content": "benefit?"},
+                {"role": "assistant", "content": "turn2"},
+                {"role": "user", "content": "again"},
+            ],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+
+    request_calls = [call for call in calls if call[1] == "v1/chat/completions"]
+    third_payload = request_calls[2][2]["json"]
+    metrics = adapter.collect_metrics().to_dict()
+
+    assert third_payload["messages"] == [
+        {"role": "user", "content": "benefit?"},
+        {"role": "assistant", "content": "turn2"},
+        {"role": "user", "content": "again"},
+    ]
+    assert metrics["details"]["continuation"]["last_decision"]["suffix_only"] is True
+
+
+def test_llama_cpp_adapter_normalizes_disable_thinking_payload(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32115",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "ping"}],
+            "metadata": {"conversation_id": "session-a"},
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+
+    request_payload = [call for call in calls if call[1] == "v1/chat/completions"][0][2]["json"]
+
+    assert request_payload["chat_template_kwargs"]["enable_thinking"] is False
+    assert request_payload["enableThinking"] is False
+    assert request_payload["reasoning"] is False
+    assert request_payload["reasoning_budget"] == 0
+    assert request_payload["reasoning_format"] == "none"
+    assert request_payload["thinking_forced_open"] is False
+
+
+def test_llama_cpp_adapter_preserves_explicit_reasoning_override(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32116",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "ping"}],
+            "metadata": {"conversation_id": "session-a"},
+            "chat_template_kwargs": {"enable_thinking": False},
+            "reasoning_format": "deepseek",
+            "reasoning_budget": -1,
+        },
+    )
+
+    request_payload = [call for call in calls if call[1] == "v1/chat/completions"][0][2]["json"]
+
+    assert request_payload["reasoning_format"] == "deepseek"
+    assert request_payload["reasoning_budget"] == -1
+    assert request_payload["enableThinking"] is False
+    assert request_payload["reasoning"] is False
 
 
 def test_llama_cpp_adapter_leaves_short_or_unkeyed_requests_unassigned(tmp_path: Path):

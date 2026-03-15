@@ -14,6 +14,7 @@ import subprocess
 import threading
 import time
 from collections import OrderedDict, deque
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
@@ -29,6 +30,7 @@ def _stringify_command(args: List[str]) -> str:
 
 
 _RECYCLE_OWNED_IDLE_SLOT_MIN_AGE_SECONDS = 1.0
+_SINGLE_SLOT_CONTINUATION_TTL_SECONDS = 600.0
 
 
 def _coerce_response_payload(response) -> Dict[str, Any]:
@@ -106,6 +108,89 @@ def _hash_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
 
 
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _canonical_messages(payload: Dict[str, Any]) -> tuple[str, ...]:
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ()
+    normalized: List[str] = []
+    for message in messages:
+        if isinstance(message, dict):
+            normalized.append(_stable_json(message))
+        else:
+            normalized.append(str(message))
+    return tuple(normalized)
+
+
+def _canonical_prompt(payload: Dict[str, Any]) -> str:
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str):
+        return prompt
+    if prompt is None:
+        return ""
+    if isinstance(prompt, list):
+        return _stable_json(prompt)
+    if isinstance(prompt, dict):
+        return _stable_json(prompt)
+    return str(prompt)
+
+
+def _canonical_message(message: Any) -> str:
+    if isinstance(message, dict):
+        return _stable_json(message)
+    return str(message)
+
+
+def _response_assistant_message(response_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    choices = response_payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        return None
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        return None
+    normalized = dict(message)
+    normalized.setdefault("role", "assistant")
+    return normalized
+
+
+def _continuation_shape_digest(path: str, payload: Dict[str, Any]) -> str:
+    shape = {
+        "path": path,
+        "model": payload.get("model"),
+        "chat_template_kwargs": payload.get("chat_template_kwargs"),
+        "tools": payload.get("tools"),
+        "tool_choice": payload.get("tool_choice"),
+        "enableThinking": payload.get("enableThinking"),
+        "reasoning": payload.get("reasoning"),
+        "reasoning_budget": payload.get("reasoning_budget"),
+        "reasoning_format": payload.get("reasoning_format"),
+        "thinking_forced_open": payload.get("thinking_forced_open"),
+        "response_format": payload.get("response_format"),
+    }
+    return hashlib.sha256(_stable_json(shape).encode("utf-8")).hexdigest()[:16]
+
+
+def _disable_thinking_requested(payload: Dict[str, Any]) -> bool:
+    chat_template_kwargs = payload.get("chat_template_kwargs")
+    if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("enable_thinking") is False:
+        return True
+    if payload.get("enableThinking") is False:
+        return True
+    if payload.get("reasoning") is False:
+        return True
+    if payload.get("reasoning_budget") == 0:
+        return True
+    if payload.get("thinking_forced_open") is False:
+        return True
+    return False
+
+
 def _infer_gguf_variant(*model_refs: str) -> str:
     pattern = re.compile(r"(IQ\d+_[A-Z0-9_]+|Q\d+_[A-Z0-9_]+)", re.IGNORECASE)
     for model_ref in model_refs:
@@ -158,6 +243,7 @@ class LlamaCppDiagnostics:
     artifact_path: str
     effective_model_path: str
     model_flag: str
+    serving_preset: str
     artifact_summary: Dict[str, Any]
     gguf_variant: str
     ctx_size: int
@@ -184,6 +270,8 @@ class LlamaCppDiagnostics:
     managed_pid: Optional[int]
     managed_process_running: bool
     startup_timeout_seconds: int
+    single_session_continuation_enabled: bool
+    single_session_continuation_ttl_seconds: int
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -220,6 +308,53 @@ class SessionBinding:
             "last_used_at": round(self.last_used_at, 3),
             "sticky_key_hash": self.sticky_key_hash,
         }
+
+
+@dataclass
+class ContinuationState:
+    conversation_id: str
+    slot_id: int
+    model_id: str
+    estimated_prompt_tokens: int
+    last_used_at: float
+    prefix_digest: str
+    request_shape_digest: str
+    prompt_mode: str
+    prompt_value: str | tuple[str, ...]
+    message_count: int
+    slot_prompt_value: str | tuple[str, ...]
+    slot_message_count: int
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "conversation_key_hash": _hash_key(self.conversation_id),
+            "slot_id": self.slot_id,
+            "model_id": self.model_id,
+            "estimated_prompt_tokens": self.estimated_prompt_tokens,
+            "last_used_at": round(self.last_used_at, 3),
+            "prefix_digest": self.prefix_digest,
+            "request_shape_digest": self.request_shape_digest,
+            "prompt_mode": self.prompt_mode,
+            "message_count": self.message_count,
+            "slot_message_count": self.slot_message_count,
+        }
+
+
+@dataclass
+class ContinuationDecision:
+    reason: str
+    conversation_key_hash: str
+    slot_id: int
+    estimated_prompt_tokens: int
+    continuation_hit: bool
+    prefix_drift: bool
+    suffix_only: bool
+    timestamp: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = asdict(self)
+        payload["timestamp"] = round(self.timestamp, 3)
+        return payload
 
 
 class LlamaCppProcessManager:
@@ -318,6 +453,20 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._slot_owners: Dict[int, str] = {}
         self._recent_slot_decisions: Deque[SlotRouteDecision] = deque(maxlen=32)
         self._last_slot_decision: Optional[SlotRouteDecision] = None
+        self._single_slot_continuation: Optional[ContinuationState] = None
+        self._recent_continuation_decisions: Deque[ContinuationDecision] = deque(maxlen=32)
+        self._last_continuation_decision: Optional[ContinuationDecision] = None
+        self._continuation_counts: Dict[str, int] = {
+            "disabled": 0,
+            "no_conversation_id": 0,
+            "cold_start": 0,
+            "hit": 0,
+            "prefix_drift": 0,
+            "shape_changed": 0,
+            "model_changed": 0,
+            "expired": 0,
+            "slot_reset": 0,
+        }
         self._slot_route_counts: Dict[str, int] = {
             "pass_through": 0,
             "explicit_slot": 0,
@@ -330,6 +479,14 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "no_routing_key": 0,
             "unkeyed_idle_slot": 0,
             "unkeyed_recycled_slot": 0,
+            "single_slot_cold_start": 0,
+            "single_slot_hit": 0,
+            "single_slot_prefix_drift": 0,
+            "single_slot_shape_changed": 0,
+            "single_slot_model_changed": 0,
+            "single_slot_expired": 0,
+            "single_slot_slot_reset": 0,
+            "single_slot_no_conversation_id": 0,
         }
 
     @classmethod
@@ -429,6 +586,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             artifact_path=self.config.artifact_path,
             effective_model_path=effective_model_path,
             model_flag=self._model_flag(effective_model_path),
+            serving_preset=self.config.serving_preset,
             artifact_summary=_artifact_summary(
                 effective_model_path,
                 model_source=self.config.model_source,
@@ -459,6 +617,12 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             managed_pid=self.process_manager.pid(),
             managed_process_running=self.process_manager.is_running(),
             startup_timeout_seconds=self.config.startup_timeout_seconds,
+            single_session_continuation_enabled=(
+                self.config.enable_session_stickiness and self.config.parallel_slots <= 1
+            ),
+            single_session_continuation_ttl_seconds=int(
+                _SINGLE_SLOT_CONTINUATION_TTL_SECONDS
+            ),
         )
 
     def _extract_slots_list(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -536,6 +700,263 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._slot_owners.pop(slot_id, None)
         if owner and binding and self._session_bindings.get(owner) is binding:
             self._session_bindings.pop(owner, None)
+
+    def _record_continuation_decision(self, decision: ContinuationDecision) -> None:
+        with self._lock:
+            self._last_continuation_decision = decision
+            self._recent_continuation_decisions.append(decision)
+            self._continuation_counts[decision.reason] = self._continuation_counts.get(
+                decision.reason, 0
+            ) + 1
+
+    def _single_slot_summary(self) -> Dict[str, Any]:
+        with self._lock:
+            state = None if self._single_slot_continuation is None else self._single_slot_continuation.to_dict()
+            recent = [decision.to_dict() for decision in self._recent_continuation_decisions]
+            last = (
+                None
+                if self._last_continuation_decision is None
+                else self._last_continuation_decision.to_dict()
+            )
+            counts = dict(self._continuation_counts)
+        return {
+            "enabled": self.config.enable_session_stickiness and self.config.parallel_slots <= 1,
+            "ttl_seconds": int(_SINGLE_SLOT_CONTINUATION_TTL_SECONDS),
+            "state": state,
+            "counts": counts,
+            "last_decision": last,
+            "recent_decisions": recent,
+        }
+
+    def _build_continuation_state(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        conversation_id: str,
+        estimated_prompt_tokens: int,
+    ) -> ContinuationState:
+        canonical_messages = _canonical_messages(payload)
+        prompt_mode = "messages" if canonical_messages else "prompt"
+        prompt_value: str | tuple[str, ...]
+        message_count = 0
+        if canonical_messages:
+            prompt_value = canonical_messages
+            message_count = len(canonical_messages)
+            prefix_bytes = "\n".join(canonical_messages).encode("utf-8")
+        else:
+            prompt_value = _canonical_prompt(payload)
+            prefix_bytes = str(prompt_value).encode("utf-8")
+        prefix_digest = hashlib.sha256(prefix_bytes).hexdigest()[:16]
+        return ContinuationState(
+            conversation_id=conversation_id,
+            slot_id=0,
+            model_id=str(payload.get("model", "")),
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            last_used_at=time.time(),
+            prefix_digest=prefix_digest,
+            request_shape_digest=_continuation_shape_digest(path, payload),
+            prompt_mode=prompt_mode,
+            prompt_value=prompt_value,
+            message_count=message_count,
+            slot_prompt_value=prompt_value,
+            slot_message_count=message_count,
+        )
+
+    def _record_single_slot_outcome(
+        self,
+        prepared: Dict[str, Any],
+        *,
+        path: str,
+        continuation_reason: str,
+        continuation_hit: bool,
+        prefix_drift: bool,
+        suffix_only: bool,
+    ) -> None:
+        routing_key = _extract_routing_key(prepared) or ""
+        estimated_prompt_tokens = _estimate_prompt_tokens(prepared)
+        decision = ContinuationDecision(
+            reason=continuation_reason,
+            conversation_key_hash=_hash_key(routing_key) if routing_key else "",
+            slot_id=int(prepared.get("id_slot", 0) or 0),
+            estimated_prompt_tokens=estimated_prompt_tokens,
+            continuation_hit=continuation_hit,
+            prefix_drift=prefix_drift,
+            suffix_only=suffix_only,
+            timestamp=time.time(),
+        )
+        self._record_continuation_decision(decision)
+        slot_reason_map = {
+            "cold_start": "single_slot_cold_start",
+            "hit": "single_slot_hit",
+            "prefix_drift": "single_slot_prefix_drift",
+            "shape_changed": "single_slot_shape_changed",
+            "model_changed": "single_slot_model_changed",
+            "expired": "single_slot_expired",
+            "slot_reset": "single_slot_slot_reset",
+            "no_conversation_id": "single_slot_no_conversation_id",
+            "disabled": "pass_through",
+        }
+        self._record_slot_decision(
+            SlotRouteDecision(
+                reason=slot_reason_map.get(continuation_reason, "pass_through"),
+                path=path,
+                slot_id=prepared.get("id_slot"),
+                estimated_prompt_tokens=estimated_prompt_tokens,
+                sticky_key_hash=_hash_key(routing_key) if routing_key else "",
+                cache_prompt=bool(prepared.get("cache_prompt", True)),
+                explicit_slot="id_slot" in prepared,
+                timestamp=time.time(),
+            )
+        )
+
+    def _prepare_single_slot_payload(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        prepared = dict(payload)
+        if prepared.get("cache_prompt") is None:
+            prepared["cache_prompt"] = True
+        routing_key = _extract_routing_key(prepared)
+        if not self.config.enable_session_stickiness:
+            self._record_single_slot_outcome(
+                prepared,
+                path=path,
+                continuation_reason="disabled",
+                continuation_hit=False,
+                prefix_drift=False,
+                suffix_only=False,
+            )
+            return prepared
+        if not routing_key:
+            self._record_single_slot_outcome(
+                prepared,
+                path=path,
+                continuation_reason="no_conversation_id",
+                continuation_hit=False,
+                prefix_drift=False,
+                suffix_only=False,
+            )
+            return prepared
+
+        prepared["id_slot"] = 0
+        estimated_prompt_tokens = _estimate_prompt_tokens(prepared)
+        next_state = self._build_continuation_state(
+            path,
+            prepared,
+            routing_key,
+            estimated_prompt_tokens,
+        )
+
+        reason = "cold_start"
+        continuation_hit = False
+        prefix_drift = False
+        suffix_only = False
+        with self._lock:
+            current = self._single_slot_continuation
+            if current is not None:
+                age_seconds = time.time() - current.last_used_at
+                if age_seconds > _SINGLE_SLOT_CONTINUATION_TTL_SECONDS:
+                    reason = "expired"
+                    self._single_slot_continuation = None
+                elif current.slot_id != 0:
+                    reason = "slot_reset"
+                    self._single_slot_continuation = None
+                elif current.conversation_id != routing_key:
+                    reason = "cold_start"
+                elif current.model_id != next_state.model_id:
+                    reason = "model_changed"
+                elif current.request_shape_digest != next_state.request_shape_digest:
+                    reason = "shape_changed"
+                elif current.prompt_mode != next_state.prompt_mode:
+                    reason = "shape_changed"
+                elif current.prompt_mode == "messages":
+                    prompt_value = next_state.prompt_value
+                    current_prompt_value = current.prompt_value
+                    if not (
+                        isinstance(prompt_value, tuple)
+                        and isinstance(current_prompt_value, tuple)
+                        and len(prompt_value) >= len(current_prompt_value)
+                        and prompt_value[: len(current_prompt_value)] == current_prompt_value
+                    ):
+                        reason = "prefix_drift"
+                        prefix_drift = True
+                    else:
+                        reason = "hit"
+                        continuation_hit = True
+                else:
+                    prompt_value = str(next_state.prompt_value)
+                    current_prompt_value = str(current.prompt_value)
+                    if not prompt_value.startswith(current_prompt_value):
+                        reason = "prefix_drift"
+                        prefix_drift = True
+                    else:
+                        reason = "hit"
+                        continuation_hit = True
+
+        if continuation_hit and next_state.prompt_mode == "messages":
+            messages = prepared.get("messages")
+            current = self._single_slot_continuation
+            slot_prompt_value = None if current is None else current.slot_prompt_value
+            slot_message_count = 0 if current is None else current.slot_message_count
+            if (
+                isinstance(messages, list)
+                and isinstance(next_state.prompt_value, tuple)
+                and isinstance(slot_prompt_value, tuple)
+                and slot_message_count > 0
+                and len(messages) >= slot_message_count
+                and len(next_state.prompt_value) >= len(slot_prompt_value)
+                and next_state.prompt_value[: len(slot_prompt_value)] == slot_prompt_value
+            ):
+                suffix_messages = messages[slot_message_count:]
+                if suffix_messages:
+                    anchor_count = 1 if slot_message_count <= 2 else 2
+                    start_index = max(0, slot_message_count - anchor_count)
+                    prepared["messages"] = messages[start_index:]
+                    suffix_only = True
+
+        self._record_single_slot_outcome(
+            prepared,
+            path=path,
+            continuation_reason=reason,
+            continuation_hit=continuation_hit,
+            prefix_drift=prefix_drift,
+            suffix_only=suffix_only,
+        )
+        return prepared
+
+    def _finalize_single_slot_request(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        response_ok: bool,
+        *,
+        response_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if path not in {"v1/chat/completions", "v1/completions"} or not response_ok:
+            return
+        if self.config.parallel_slots > 1:
+            return
+        conversation_id = _extract_routing_key(payload)
+        if not conversation_id or payload.get("id_slot") != 0:
+            return
+        estimated_prompt_tokens = _estimate_prompt_tokens(payload)
+        next_state = self._build_continuation_state(
+            path,
+            payload,
+            conversation_id,
+            estimated_prompt_tokens,
+        )
+        if (
+            path == "v1/chat/completions"
+            and next_state.prompt_mode == "messages"
+            and isinstance(next_state.prompt_value, tuple)
+            and isinstance(response_payload, dict)
+        ):
+            assistant_message = _response_assistant_message(response_payload)
+            if assistant_message is not None:
+                next_state.slot_prompt_value = next_state.prompt_value + (
+                    _canonical_message(assistant_message),
+                )
+                next_state.slot_message_count = next_state.message_count + 1
+        with self._lock:
+            self._single_slot_continuation = next_state
 
     def _record_slot_decision(self, decision: SlotRouteDecision) -> None:
         with self._lock:
@@ -646,7 +1067,22 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             return prepared
         if prepared.get("cache_prompt") is None:
             prepared["cache_prompt"] = True
-        if self.config.parallel_slots <= 1 or not self.config.enable_session_stickiness:
+        if path == "v1/chat/completions" and _disable_thinking_requested(prepared):
+            chat_template_kwargs = prepared.get("chat_template_kwargs")
+            if not isinstance(chat_template_kwargs, dict):
+                chat_template_kwargs = {}
+            else:
+                chat_template_kwargs = dict(chat_template_kwargs)
+            chat_template_kwargs["enable_thinking"] = False
+            prepared["chat_template_kwargs"] = chat_template_kwargs
+            prepared.setdefault("enableThinking", False)
+            prepared.setdefault("reasoning", False)
+            prepared.setdefault("reasoning_budget", 0)
+            prepared.setdefault("reasoning_format", "none")
+            prepared.setdefault("thinking_forced_open", False)
+        if self.config.parallel_slots <= 1:
+            return self._prepare_single_slot_payload(path, prepared)
+        if not self.config.enable_session_stickiness:
             self._record_slot_decision(
                 SlotRouteDecision(
                     reason="pass_through",
@@ -866,9 +1302,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         metrics = super().collect_metrics()
         props = self._request_optional_json("props")
         slots = self._request_optional_json("slots")
-        details: Dict[str, Any] = {
+        details: Dict[str, Any] = dict(metrics.details or {})
+        details.update({
             "diagnostics": self.diagnostics().to_dict(),
-        }
+            "continuation": self._single_slot_summary(),
+        })
         if props:
             details["props"] = props
         if slots:
@@ -883,8 +1321,40 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
     def proxy(self, method: str, path: str, **kwargs: Any):
         payload = kwargs.get("json")
         if isinstance(payload, dict):
-            kwargs["json"] = self._prepare_proxy_payload(path, payload)
-        return super().proxy(method, path, **kwargs)
+            state_payload = deepcopy(payload)
+            prepared = self._prepare_proxy_payload(path, payload)
+            kwargs["json"] = prepared
+            for key in (
+                "cache_prompt",
+                "id_slot",
+                "chat_template_kwargs",
+                "enableThinking",
+                "reasoning",
+                "reasoning_budget",
+                "reasoning_format",
+                "thinking_forced_open",
+            ):
+                if key in prepared:
+                    state_payload[key] = deepcopy(prepared[key])
+        else:
+            prepared = None
+            state_payload = None
+        response = super().proxy(method, path, **kwargs)
+        if isinstance(prepared, dict):
+            response_payload = None
+            content_type = response.headers.get("content-type", "")
+            if response.ok and "application/json" in content_type:
+                try:
+                    response_payload = response.json()
+                except Exception:
+                    response_payload = None
+            self._finalize_single_slot_request(
+                path,
+                state_payload if isinstance(state_payload, dict) else prepared,
+                response.ok,
+                response_payload=response_payload,
+            )
+        return response
 
     def start_runtime(self) -> Dict[str, Any]:
         command = self._build_launch_command()
@@ -905,7 +1375,9 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         return {**self.process_manager.logs(lines=lines), "mode": "llama_cpp"}
 
     def cache_report(self) -> Dict[str, Any]:
-        payload: Dict[str, Any] = {}
+        payload: Dict[str, Any] = {
+            "continuation": self._single_slot_summary(),
+        }
         props = self._request_optional_json("props")
         slots = self._request_optional_json("slots")
         if props:

@@ -54,14 +54,30 @@
 This repository now also includes an experimental `omlx_dgx` package for
 researching a DGX-oriented runtime around SGLang/HiCache, TensorRT-LLM, and
 `llama.cpp` GGUF serving. The most mature DGX result in the repo today is
-`Qwen3.5-4B Q4_K_S` on `llama.cpp`, where the control plane adds oMLX-style
+`Qwen3.5-4B Q4_K_M` on `llama.cpp`, where the control plane adds oMLX-style
 session stickiness so short concurrent requests do not blow away a long
-conversation's warm prefix.
+conversation's warm prefix. The current DGX Spark defaults are split into two
+named presets:
+
+- `single_session_low_latency` for one local long-running chat (`parallel_slots=1`, `ctx_size=32768`)
+- `mixed_traffic` for long-context + short-request concurrency (`parallel_slots=2`, `ctx_size=32768`)
 
 Current measured mixed-traffic result on DGX Spark:
 
 - `omlx_dgx + llama.cpp`: repeated long request `0.097s`, concurrent short request `0.176s`, total mixed makespan `0.192s`
 - `LM Studio`: repeated long request `0.131s`, concurrent short request `0.366s`, total mixed makespan `0.367s`
+
+Current measured single-session follow-up result on DGX Spark:
+
+- `Q4_K_M`: `0.111s` average follow-up latency
+- `Q4_K_S`: `0.115s` average follow-up latency
+- `Q6_K`: `0.135s` average follow-up latency
+
+Against `LM Studio` on the same `Q4_K_M` and `32k` context, the current
+single-session follow-up path in `omlx_dgx + llama.cpp` is faster:
+
+- `omlx_dgx + llama.cpp`: `0.111s` average follow-up latency
+- `LM Studio`: `0.238s` average follow-up latency
 
 See [README.dgx.md](README.dgx.md) for the current scope, launcher, and the
 latest benchmark notes.

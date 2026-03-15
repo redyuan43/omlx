@@ -34,9 +34,10 @@ For `Qwen3.5-4B` quantized serving on DGX Spark, the current best path in this
 repo is:
 
 - `GGUF + llama.cpp`
-- `Q4_K_S`
-- `parallel_slots=1` for single-session use
-- `parallel_slots=2 + session stickiness` for mixed traffic
+- `Q4_K_M`
+- `single_session_low_latency` preset for single-session use
+- `mixed_traffic` preset for long-context + short-request concurrency
+- `ctx_size=32768` as the current DGX Spark default for llama.cpp presets
 
 This keeps the original oMLX idea at the control-plane layer: do not let short
 requests blow away a long conversation's warm prefix.
@@ -62,8 +63,37 @@ With `parallel_slots=2 + session stickiness`, the control plane now pins the
 long session to its slot and routes the short request away from that hot prefix.
 After fixing stale-slot recycling, the mixed benchmark became stable.
 
-Measured on `Qwen3.5-4B-Q4_K_S.gguf`:
+Measured on `Qwen3.5-4B` GGUF variants:
 
+- `Q4_K_M`
+  - single-session follow-up avg: `0.111s`
+  - long output throughput: `53.333 tok/s`
+  - long prefix run 1 / run 2: `2.082s / 0.066s`
+- `Q4_K_S`
+  - single-session follow-up avg: `0.115s`
+  - long output throughput: `54.432 tok/s`
+  - long prefix run 1 / run 2: `2.075s / 0.067s`
+- `Q6_K`
+  - single-session follow-up avg: `0.135s`
+  - long output throughput: `45.077 tok/s`
+  - long prefix run 1 / run 2: `2.163s / 0.075s`
+
+For the current DGX Spark workload, `Q4_K_M` is the recommended default because
+it gives the best long-context follow-up latency with only a minor throughput
+tradeoff versus `Q4_K_S`.
+
+Compared against `LM Studio` on the same `Q4_K_M` quantization and `32k`
+context, the current single-session follow-up path in `omlx_dgx + llama.cpp`
+is faster on continued turns:
+
+- `omlx_dgx + llama.cpp`
+  - turn2 follow-up: `0.124s`
+  - turn3 follow-up: `0.099s`
+  - follow-up avg: `0.111s`
+- `LM Studio`
+  - turn2 follow-up: `0.225s`
+  - turn3 follow-up: `0.251s`
+  - follow-up avg: `0.238s`
 - `omlx_dgx + llama.cpp`
   - warm long request: `1.764s`
   - repeated long request: `0.097s`
@@ -97,6 +127,71 @@ it added oMLX-style scheduling on top:
 That means the current advantage is strongest when your workload includes long
 conversations plus unrelated short requests or multiple chats at once.
 
+## DGX Spark Presets
+
+The managed `llama.cpp` adapter now exposes two named presets:
+
+- `single_session_low_latency`
+  - `parallel_slots=1`
+  - `ctx_size=32768`
+  - single-session continuation enabled
+  - default DGX Spark preset for local chat
+- `mixed_traffic`
+  - `parallel_slots=2`
+  - `ctx_size=32768`
+  - slot stickiness enabled
+  - intended for long-context plus short-request concurrency
+
+You can select them from the CLI:
+
+```bash
+omlx-dgx serve \
+  --backend-kind llama_cpp \
+  --quant-mode gguf_experimental \
+  --model-source gguf \
+  --artifact-path /models/Qwen3.5-4B-Q4_K_M.gguf \
+  --serving-preset single_session_low_latency
+```
+
+## Telemetry
+
+`/admin/api/runtime` now preserves the low-level GPU telemetry state instead of
+silently hiding it. On this DGX Spark, if `nvidia-smi` fails with an NVML error,
+you will see it under:
+
+- `backend.details.telemetry.gpu_metrics_ok`
+- `backend.details.telemetry.gpu_metrics_error`
+- `backend.details.telemetry.system_memory_kb`
+
+This makes it possible to distinguish "no GPU info because nothing is wrong"
+from "no GPU info because NVML is currently broken".
+
+## Matrix Benchmarking
+
+Use the matrix script to compare `Q4_K_S`, `Q4_K_M`, `Q6_K` and `16k/32k`
+variants across both single-session follow-up and mixed traffic:
+
+```bash
+python3 scripts/bench_qwen35_4b_matrix.py \
+  --omlx-variant q4ks-16k,http://127.0.0.1:8020,http://127.0.0.1:31200 \
+  --omlx-variant q4km-32k,http://127.0.0.1:8021,http://127.0.0.1:31201 \
+  --omlx-variant q6k-32k,http://127.0.0.1:8022,http://127.0.0.1:31202 \
+  --lmstudio-variant lmstudio,http://127.0.0.1:1234,qwen3.5-4b \
+  --include-concurrency
+```
+
+The output now includes:
+
+- `serving_preset`
+- telemetry health/error fields
+- single-session follow-up latency
+- mixed-traffic makespan
+- automatic recommendations for:
+  - best single-session follow-up
+  - best mixed-traffic profile
+  - best long-output throughput
+  - best cold long-prefix latency
+
 ## Package Layout
 
 - `omlx_dgx/cache_core.py`: block hashes, LRU queue, content-addressed block ledger
@@ -111,6 +206,6 @@ conversations plus unrelated short requests or multiple chats at once.
 
 ## Next Runtime Hook Points
 
-- Keep `parallel_slots=1` as the default preset for single-session local chat.
-- Keep `parallel_slots=2 + session stickiness` as an experimental preset for mixed traffic.
-- Benchmark `Q4_K_M` and `Q6_K` under the same mixed-traffic workload before changing the default GGUF variant.
+- Keep `single_session_low_latency` as the default preset for local DGX Spark chat.
+- Keep `mixed_traffic` as the experimental preset for concurrent workloads.
+- Keep `Q4_K_M` as the default GGUF variant unless your workload is dominated by long-output throughput.

@@ -27,17 +27,27 @@ def _summarize(payload: Dict[str, Any]) -> Dict[str, Any]:
     long_prefix_1 = payload.get("long_prefix_run_1", {})
     long_prefix_2 = payload.get("long_prefix_run_2", {})
     long_output = payload.get("long_output_chat", {})
+    followup = payload.get("single_session_followup", {}).get("summary", {})
     runtime_summary = payload.get("runtime_summary", {})
+    telemetry = runtime_summary.get("telemetry", {})
     summary = {
         "backend_format": runtime_summary.get("backend_format"),
         "quant_mode": runtime_summary.get("quant_mode"),
         "model_source": runtime_summary.get("model_source"),
         "gguf_variant": runtime_summary.get("gguf_variant"),
+        "serving_preset": runtime_summary.get("serving_preset"),
         "loaded_context_length": runtime_summary.get("loaded_context_length"),
         "ctx_size": runtime_summary.get("ctx_size"),
         "parallel_slots": runtime_summary.get("parallel_slots"),
+        "telemetry_gpu_metrics_ok": telemetry.get("gpu_metrics_ok"),
+        "telemetry_gpu_metrics_error": telemetry.get("gpu_metrics_error"),
         "short_chat_wall_time_sec": payload.get("short_chat", {}).get("wall_time_sec"),
         "multi_turn_wall_time_sec": payload.get("multi_turn_chat", {}).get("wall_time_sec"),
+        "single_session_turn2_short_followup_sec": followup.get("turn2_short_followup_sec"),
+        "single_session_turn3_short_followup_sec": followup.get("turn3_short_followup_sec"),
+        "single_session_followup_avg_sec": followup.get("followup_avg_sec"),
+        "single_session_turn2_continuation_hit": followup.get("turn2_continuation_hit"),
+        "single_session_turn3_continuation_hit": followup.get("turn3_continuation_hit"),
         "long_output_token_per_second": long_output.get("token_per_second"),
         "long_output_decode_token_per_second": long_output.get("decode_token_per_second"),
         "long_prefix_run_1_sec": long_prefix_1.get("wall_time_sec"),
@@ -66,6 +76,66 @@ def _summarize_concurrency(payload: Dict[str, Any]) -> Dict[str, Any]:
         "repeat_parallel_makespan_sec": parallel.get("makespan_sec"),
         "repeat_speedup_x": repeat.get("repeat_speedup_x"),
     }
+
+
+def _pick_best(
+    metrics: Dict[str, Dict[str, Any]],
+    field_name: str,
+    *,
+    prefer: str,
+) -> Dict[str, Any] | None:
+    candidates = []
+    for label, payload in metrics.items():
+        value = payload.get(field_name)
+        if value is None:
+            continue
+        candidates.append((label, value, payload))
+    if not candidates:
+        return None
+    reverse = prefer == "max"
+    label, value, payload = sorted(candidates, key=lambda item: item[1], reverse=reverse)[0]
+    return {
+        "label": label,
+        "metric_name": field_name,
+        "metric_value": value,
+        "summary": payload,
+    }
+
+
+def _build_recommendations(
+    summary: Dict[str, Dict[str, Any]],
+    concurrency_summary: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    recommendations: Dict[str, Any] = {}
+    single_session = _pick_best(
+        summary,
+        "single_session_followup_avg_sec",
+        prefer="min",
+    )
+    if single_session is not None:
+        recommendations["single_session_followup"] = single_session
+    long_output = _pick_best(
+        summary,
+        "long_output_token_per_second",
+        prefer="max",
+    )
+    if long_output is not None:
+        recommendations["long_output_throughput"] = long_output
+    cold_prefix = _pick_best(
+        summary,
+        "long_prefix_run_1_sec",
+        prefer="min",
+    )
+    if cold_prefix is not None:
+        recommendations["cold_long_prefix"] = cold_prefix
+    mixed = _pick_best(
+        concurrency_summary,
+        "repeat_parallel_makespan_sec",
+        prefer="min",
+    )
+    if mixed is not None:
+        recommendations["mixed_traffic"] = mixed
+    return recommendations
 
 
 def _parse_omlx_variant(raw_value: str) -> tuple[str, str, str]:
@@ -176,6 +246,10 @@ def main() -> None:
             label: _summarize_concurrency(payload)
             for label, payload in concurrency_variants.items()
         }
+    output["recommendations"] = _build_recommendations(
+        output["summary"],
+        output.get("concurrency_summary", {}),
+    )
     print(json.dumps(output, indent=2, ensure_ascii=False))
 
 
