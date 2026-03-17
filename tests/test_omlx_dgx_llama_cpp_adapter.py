@@ -141,6 +141,25 @@ def test_llama_cpp_adapter_uses_hf_flag_for_remote_gguf_reference(tmp_path: Path
     assert diagnostics["gguf_variant"] == "Q4_K_S"
 
 
+def test_llama_cpp_rerank_model_enables_reranking_endpoint(tmp_path: Path):
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32119",
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        model_repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+
+    command = adapter._build_launch_command()
+    capabilities = adapter.capabilities()
+
+    assert "--reranking" in command
+    assert capabilities.rerank is True
+    assert capabilities.chat_completions is False
+    assert capabilities.completions is False
+
+
 def test_llama_cpp_adapter_collects_props_and_slots(tmp_path: Path):
     gguf_path = tmp_path / "Qwen3.5-4B-Q6_K.gguf"
     gguf_path.write_bytes(b"GGUF")
@@ -199,6 +218,62 @@ def test_llama_cpp_adapter_collects_props_and_slots(tmp_path: Path):
     assert cache_report["slot_router"]["slot_summary"][0]["id"] == 0
     assert cache_report["continuation"]["ttl_seconds"] == 600
     assert cache_report["session_restore"]["slot_save_path"].endswith("/runtime/slot_saves")
+
+
+def test_llama_cpp_model_pool_external_openai_embedding_registration(tmp_path: Path):
+    runtime_config = DGXRuntimeConfig(
+        backend=BackendConfig(
+            kind="llama_cpp",
+            base_url="http://127.0.0.1:32120",
+            model_pool=LlamaCppModelPoolConfig(
+                models={
+                    "nomic-embed": LlamaCppModelRegistration(
+                        model_id="nomic-embed",
+                        model_alias="embed-text",
+                        backend_kind="openai_compatible",
+                        backend_model_name="text-embedding-nomic-embed-text-v1.5",
+                        base_url="http://127.0.0.1:1234",
+                        supports_embeddings=True,
+                        pinned=True,
+                    )
+                }
+            ),
+        ),
+        models={
+            "nomic-embed": ModelProfile(
+                model_id="nomic-embed",
+                model_alias="embed-text",
+                is_default=True,
+                supports_embeddings=True,
+            )
+        },
+    )
+    adapter = LlamaCppModelPoolAdapter.from_runtime_config(runtime_config, tmp_path)
+    handle = adapter._models["nomic-embed"]
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        assert path == "v1/embeddings"
+        assert kwargs["json"]["model"] == "text-embedding-nomic-embed-text-v1.5"
+        return FakeResponse(
+            json_data={
+                "object": "list",
+                "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+                "model": kwargs["json"]["model"],
+            },
+            headers={"content-type": "application/json"},
+        )
+
+    handle.adapter._request = fake_request  # type: ignore[attr-defined,method-assign]
+
+    response = adapter.proxy(
+        "POST",
+        "v1/embeddings",
+        json={"model": "embed-text", "input": "hello"},
+    )
+
+    assert response.json()["model"] == "text-embedding-nomic-embed-text-v1.5"
+    assert adapter.capabilities().embeddings is True
+    assert adapter.capabilities().chat_completions is False
 
 
 def test_llama_cpp_adapter_surfaces_nvml_errors_in_telemetry(tmp_path: Path, monkeypatch):

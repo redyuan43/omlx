@@ -111,6 +111,13 @@ def test_model_profile_infers_multimodal_capabilities_from_name():
     assert ocr_profile.supports_vision is True
     assert ocr_profile.supports_ocr is True
 
+    embedding_profile = ModelProfile(model_id="text-embedding-nomic-embed-text-v1.5")
+    assert embedding_profile.supports_embeddings is True
+    assert embedding_profile.supports_rerank is False
+
+    rerank_profile = ModelProfile(model_id="Qwen3-Reranker-0.6B")
+    assert rerank_profile.supports_rerank is True
+
 
 def test_manifest_store_round_trip(tmp_path: Path):
     store = PersistentManifestStore(tmp_path / "cache")

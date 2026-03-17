@@ -26,7 +26,7 @@ from omlx_dgx.config import (
     LlamaCppModelRegistration,
     apply_llama_cpp_serving_preset,
 )
-from omlx_dgx.model_capabilities import infer_multimodal_capabilities
+from omlx_dgx.model_capabilities import infer_model_capabilities, infer_multimodal_capabilities
 from omlx_dgx.session_restore import (
     SessionRestoreSnapshot,
     SessionRestoreStore,
@@ -37,6 +37,7 @@ from .backend import (
     BackendAdapter,
     BackendCapabilities,
     BackendError,
+    ExternalOpenAIModelAdapter,
     HttpOpenAIBackendAdapter,
     RuntimeMetrics,
 )
@@ -294,6 +295,8 @@ class LlamaCppDiagnostics:
     single_session_continuation_enabled: bool
     single_session_continuation_ttl_seconds: int
     slot_save_path: str
+    supports_embeddings: bool
+    supports_rerank: bool
     supports_vision: bool
     supports_ocr: bool
 
@@ -604,6 +607,12 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             args.extend(["--cache-reuse", str(self.config.cache_reuse)])
         if self.config.enable_runtime_metrics:
             args.append("--metrics")
+        model_capabilities = infer_model_capabilities(
+            self.config.artifact_path,
+            self.config.model_repo_id,
+        )
+        if model_capabilities.rerank:
+            args.append("--reranking")
         if self.config.enable_session_restore:
             args.extend(["--slot-save-path", str(self._slot_save_path)])
         if self.config.no_context_shift:
@@ -623,6 +632,10 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         except BackendError as exc:
             launcher_cmd_error = str(exc)
         gguf_variant = self._gguf_variant()
+        model_capabilities = infer_model_capabilities(
+            self.config.artifact_path,
+            self.config.model_repo_id,
+        )
         return LlamaCppDiagnostics(
             adapter="llama_cpp",
             backend_format=self._backend_format(),
@@ -675,15 +688,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 _SINGLE_SLOT_CONTINUATION_TTL_SECONDS
             ),
             slot_save_path=str(self._slot_save_path),
+            supports_embeddings=model_capabilities.embeddings,
+            supports_rerank=model_capabilities.rerank,
             supports_vision=gguf_variant.startswith("VL")
-            or infer_multimodal_capabilities(
-                self.config.artifact_path,
-                self.config.model_repo_id,
-            ).vision_chat,
-            supports_ocr=infer_multimodal_capabilities(
-                self.config.artifact_path,
-                self.config.model_repo_id,
-            ).ocr,
+            or model_capabilities.vision_chat,
+            supports_ocr=model_capabilities.ocr,
         )
 
     def _extract_slots_list(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -2001,6 +2010,12 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         return metrics
 
     def proxy(self, method: str, path: str, **kwargs: Any):
+        model_capabilities = infer_model_capabilities(
+            self.config.artifact_path,
+            self.config.model_repo_id,
+        )
+        if path == "v1/rerank" and model_capabilities.rerank:
+            path = "reranking"
         payload = kwargs.get("json")
         if isinstance(payload, dict):
             state_payload = deepcopy(payload)
@@ -2099,15 +2114,18 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         return payload
 
     def capabilities(self) -> BackendCapabilities:
-        multimodal = infer_multimodal_capabilities(
+        capabilities = infer_model_capabilities(
             self.config.artifact_path,
             self.config.model_repo_id,
         )
+        is_rerank = capabilities.rerank
         return BackendCapabilities(
-            chat_completions=True,
-            completions=True,
-            vision_chat=multimodal.vision_chat,
-            ocr=multimodal.ocr,
+            chat_completions=not is_rerank,
+            completions=not is_rerank,
+            embeddings=capabilities.embeddings,
+            rerank=capabilities.rerank,
+            vision_chat=capabilities.vision_chat,
+            ocr=capabilities.ocr,
         )
 
 
@@ -2130,7 +2148,7 @@ class ModelPoolEvent:
 @dataclass
 class _PooledModelHandle:
     registration: LlamaCppModelRegistration
-    adapter: LlamaCppBackendAdapter
+    adapter: BackendAdapter
     loaded: bool = False
     loaded_at: Optional[float] = None
     last_used_at: Optional[float] = None
@@ -2218,6 +2236,7 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
             resolved[self._default_model_id] = LlamaCppModelRegistration(
                 model_id=self._default_model_id,
                 model_alias=None if primary_profile is None else primary_profile.model_alias,
+                backend_kind="llama_cpp",
                 model_repo_id="" if primary_artifact_path else self.config.model_repo_id,
                 artifact_path=primary_artifact_path,
                 gguf_variant=self.config.gguf_variant,
@@ -2239,6 +2258,8 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                 model_id=model_id,
                 model_alias=registration.model_alias
                 or (None if profile is None else profile.model_alias),
+                backend_kind=registration.backend_kind,
+                backend_model_name=registration.backend_model_name,
                 model_repo_id=registration.model_repo_id
                 or ("" if artifact_path else self.config.model_repo_id),
                 artifact_path=artifact_path,
@@ -2304,12 +2325,42 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
             )
 
         model_state_dir = self.state_dir / _sanitize_model_dir_name(registration.model_id)
-        adapter = LlamaCppBackendAdapter.from_backend_config(
-            self._adapter_config_for_registration(registration),
-            model_state_dir,
-        )
+        if registration.backend_kind == "openai_compatible":
+            external_model_name = (
+                registration.backend_model_name
+                or registration.model_repo_id
+                or registration.model_alias
+                or registration.model_id
+            )
+            adapter: BackendAdapter = ExternalOpenAIModelAdapter(
+                base_url=registration.base_url or self.config.base_url,
+                target_model_name=external_model_name,
+                capabilities=BackendCapabilities(
+                    chat_completions=bool(
+                        registration.supports_vision or registration.supports_ocr
+                    ),
+                    completions=bool(
+                        registration.supports_vision or registration.supports_ocr
+                    ),
+                    embeddings=registration.supports_embeddings,
+                    rerank=registration.supports_rerank,
+                    vision_chat=registration.supports_vision,
+                    ocr=registration.supports_ocr,
+                ),
+            )
+        else:
+            adapter = LlamaCppBackendAdapter.from_backend_config(
+                self._adapter_config_for_registration(registration),
+                model_state_dir,
+            )
         handle = _PooledModelHandle(registration=registration, adapter=adapter)
-        if adapter.process_manager.is_running():
+        if registration.backend_kind == "openai_compatible":
+            now = time.time()
+            handle.loaded = True
+            handle.loaded_at = now
+            handle.last_used_at = now
+            handle.last_load_reason = "external_backend"
+        elif isinstance(adapter, LlamaCppBackendAdapter) and adapter.process_manager.is_running():
             now = time.time()
             handle.loaded = True
             handle.loaded_at = now
@@ -2506,13 +2557,20 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                         "loaded": handle.loaded,
                         "pinned": handle.registration.pinned,
                         "base_url": handle.registration.base_url or handle.adapter.base_url,
+                        "backend_kind": handle.registration.backend_kind,
+                        "backend_model_name": handle.registration.backend_model_name,
                         "model_repo_id": handle.registration.model_repo_id,
                         "artifact_path": handle.registration.artifact_path,
                         "gguf_variant": handle.registration.gguf_variant,
                         "serving_preset": handle.registration.serving_preset,
-                        "ctx_size": handle.registration.ctx_size or handle.adapter.config.ctx_size,
+                        "ctx_size": handle.registration.ctx_size
+                        or getattr(getattr(handle.adapter, "config", None), "ctx_size", 0),
                         "parallel_slots": handle.registration.parallel_slots
-                        or handle.adapter.config.parallel_slots,
+                        or getattr(
+                            getattr(handle.adapter, "config", None),
+                            "parallel_slots",
+                            0,
+                        ),
                         "ttl_seconds": handle.registration.ttl_seconds,
                         "ttl_remaining_seconds": (
                             None if ttl_remaining is None else round(ttl_remaining, 3)
@@ -2530,6 +2588,8 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                         "last_eviction_reason": handle.last_eviction_reason,
                         "request_count": handle.request_count,
                         "capabilities": {
+                            "embeddings": handle.registration.supports_embeddings,
+                            "rerank": handle.registration.supports_rerank,
                             "vision_chat": handle.registration.supports_vision,
                             "ocr": handle.registration.supports_ocr,
                         },
@@ -2591,7 +2651,12 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
             handle = self._require_handle_locked(model_id)
         if isinstance(payload, dict):
             payload = dict(payload)
-            payload.setdefault("model", model_id)
+            target_model_name = (
+                handle.registration.backend_model_name
+                or handle.registration.model_repo_id
+                or model_id
+            )
+            payload["model"] = target_model_name
             kwargs["json"] = payload
         response = handle.adapter.proxy(method, path, **kwargs)
         with self._lock:
@@ -2659,18 +2724,31 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
         return payload
 
     def capabilities(self) -> BackendCapabilities:
-        focus_handle = self._models.get(self._default_model_id)
-        if focus_handle is None and self._models:
-            focus_handle = next(iter(self._models.values()))
-        if focus_handle is None:
+        aggregate = BackendCapabilities()
+        for handle in self._models.values():
+            capabilities = handle.adapter.capabilities()
+            registration = handle.registration
+            aggregate = BackendCapabilities(
+                chat_completions=aggregate.chat_completions or capabilities.chat_completions,
+                completions=aggregate.completions or capabilities.completions,
+                embeddings=aggregate.embeddings or (
+                    capabilities.embeddings and registration.supports_embeddings
+                ),
+                rerank=aggregate.rerank or (
+                    capabilities.rerank and registration.supports_rerank
+                ),
+                vision_chat=aggregate.vision_chat or (
+                    capabilities.vision_chat and registration.supports_vision
+                ),
+                ocr=aggregate.ocr or (capabilities.ocr and registration.supports_ocr),
+            )
+        if not self._models:
             return BackendCapabilities()
-        capabilities = focus_handle.adapter.capabilities()
-        registration = focus_handle.registration
         return BackendCapabilities(
-            chat_completions=capabilities.chat_completions,
-            completions=capabilities.completions,
-            embeddings=capabilities.embeddings,
-            rerank=capabilities.rerank,
-            vision_chat=capabilities.vision_chat and registration.supports_vision,
-            ocr=capabilities.ocr and registration.supports_ocr,
+            chat_completions=aggregate.chat_completions,
+            completions=aggregate.completions,
+            embeddings=aggregate.embeddings,
+            rerank=aggregate.rerank,
+            vision_chat=aggregate.vision_chat,
+            ocr=aggregate.ocr,
         )

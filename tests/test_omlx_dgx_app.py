@@ -432,6 +432,60 @@ def test_embeddings_endpoint_proxies_when_backend_declares_capability(tmp_path: 
     assert backend.calls[-1][1] == "v1/embeddings"
 
 
+def test_embeddings_endpoint_rejects_model_without_embedding_capability(tmp_path: Path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            embeddings=True,
+        )
+    )
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.ensure_model(ModelProfile(model_id="qwen35-4b", model_alias="qwen35", is_default=True))
+    app = create_app(
+        settings_manager=settings,
+        backend=backend,
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(
+        app,
+        "POST",
+        "/v1/embeddings",
+        json={"model": "qwen35", "input": "hello"},
+    )
+
+    assert response.status_code == 501
+    assert response.json()["detail"]["service"] == "embeddings"
+
+
+def test_rerank_endpoint_rejects_model_without_rerank_capability(tmp_path: Path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            rerank=True,
+        )
+    )
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.ensure_model(ModelProfile(model_id="qwen35-4b", model_alias="qwen35", is_default=True))
+    app = create_app(
+        settings_manager=settings,
+        backend=backend,
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(
+        app,
+        "POST",
+        "/v1/rerank",
+        json={"model": "qwen35", "query": "hello", "documents": ["doc-a"]},
+    )
+
+    assert response.status_code == 501
+    assert response.json()["detail"]["service"] == "rerank"
+
+
 def test_rerank_endpoint_proxies_when_backend_declares_capability(tmp_path: Path):
     backend = FakeBackend(
         capabilities=BackendCapabilities(

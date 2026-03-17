@@ -12,8 +12,8 @@ runtime path:
 - Backend-agnostic block metadata and scheduler policy ported from oMLX ideas
 - Tiered KV manifest store with cross-restart SSD metadata persistence
 - Capability-aware HTTP service endpoints for `/v1/chat/completions`,
-  `/v1/completions`, and `/v1/messages`, plus explicit unsupported-capability
-  responses for `/v1/embeddings` and `/v1/rerank` on chat-only backends
+  `/v1/completions`, `/v1/messages`, `/v1/embeddings`, and `/v1/rerank`
+  with model-level gating per registered backend
 - A minimal web console at `/admin`
 
 ## Quick Start
@@ -31,6 +31,29 @@ omlx-dgx serve \
 This does not yet fork SGLang or TensorRT-LLM internals. Instead, it provides
 the control plane and runtime/storage interfaces that the DGX path can build on
 next.
+
+## Current DGX Capability Matrix
+
+The current DGX path now supports four capability classes behind the same
+control-plane:
+
+- text chat/completions:
+  - primary path: `llama.cpp + Qwen3.5-4B GGUF`
+- embeddings:
+  - current live path: external OpenAI-compatible embedding model registration
+  - validated against local `LM Studio` with
+    `text-embedding-nomic-embed-text-v1.5`
+- VLM and OCR:
+  - current live path: external OpenAI-compatible model registration
+  - validated against local `LM Studio` with `qwen/qwen3-vl-8b` and
+    `glm-ocr@q4_k_s`
+- rerank:
+  - current live path: managed `llama.cpp --reranking`
+  - validated against `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF`
+
+On DGX, these capabilities are model-scoped rather than backend-global. A model
+registered as `embeddings` will not be allowed to answer chat requests, and a
+reranker will not be exposed as a chat model.
 
 ## Current Recommendation
 

@@ -164,6 +164,18 @@ def _parse_model_pool_registration(
             )
         ),
         is_default=is_default,
+        supports_embeddings=bool(
+            body.get(
+                "supports_embeddings",
+                existing_profile.supports_embeddings if existing_profile else False,
+            )
+        ),
+        supports_rerank=bool(
+            body.get(
+                "supports_rerank",
+                existing_profile.supports_rerank if existing_profile else False,
+            )
+        ),
         supports_vision=bool(
             body.get(
                 "supports_vision",
@@ -199,6 +211,20 @@ def _parse_model_pool_registration(
     registration = LlamaCppModelRegistration(
         model_id=model_id,
         model_alias=profile.model_alias,
+        backend_kind=str(
+            body.get(
+                "backend_kind",
+                existing_registration.backend_kind if existing_registration else "llama_cpp",
+            )
+            or "llama_cpp"
+        ),
+        backend_model_name=str(
+            body.get(
+                "backend_model_name",
+                existing_registration.backend_model_name if existing_registration else "",
+            )
+            or ""
+        ),
         model_repo_id=str(
             body.get(
                 "model_repo_id",
@@ -258,6 +284,18 @@ def _parse_model_pool_registration(
         pinned=bool(pinned),
         ttl_seconds=int(ttl_seconds or 0),
         idle_unload_seconds=int(idle_unload_seconds or 0),
+        supports_embeddings=bool(
+            body.get(
+                "supports_embeddings",
+                existing_registration.supports_embeddings if existing_registration else False,
+            )
+        ),
+        supports_rerank=bool(
+            body.get(
+                "supports_rerank",
+                existing_registration.supports_rerank if existing_registration else False,
+            )
+        ),
         supports_vision=bool(
             body.get(
                 "supports_vision",
@@ -352,6 +390,48 @@ def _effective_multimodal_support(
     return {"vision_chat": supports_vision, "ocr": supports_ocr}
 
 
+def _profile_supports_service(
+    profile: Optional[ModelProfile],
+    service_name: str,
+) -> bool:
+    if profile is None:
+        return True
+    if service_name == "embeddings":
+        return profile.supports_embeddings
+    if service_name == "rerank":
+        return profile.supports_rerank
+    if service_name in {"chat_completions", "completions", "messages"}:
+        if profile.supports_embeddings or profile.supports_rerank:
+            return profile.supports_vision or profile.supports_ocr
+        return True
+    return True
+
+
+def _effective_service_support(
+    services: AppServices,
+    path: str,
+    payload: Optional[dict] = None,
+) -> dict[str, Any]:
+    capabilities = _service_capabilities(services)
+    service = dict(capabilities["services"].get(path, {}))
+    if not service:
+        return {"service": "", "supported": False}
+    if payload is None:
+        return service
+    profile = _resolve_model_profile(payload, services.settings)
+    service["model_id"] = None if profile is None else profile.model_id
+    if not _profile_supports_service(profile, str(service.get("service") or "")):
+        service["supported"] = False
+        service_name = str(service.get("service") or "")
+        if service_name == "embeddings":
+            service["detail"] = "the selected model does not support embeddings"
+        elif service_name == "rerank":
+            service["detail"] = "the selected model does not support rerank"
+        else:
+            service["detail"] = "the selected model does not support this generation surface"
+    return service
+
+
 def _service_capabilities(services: AppServices) -> dict:
     backend_caps = services.backend.capabilities()
     services_map = {
@@ -431,11 +511,12 @@ def _raise_unsupported_capability(
     services: AppServices,
     path: str,
     *,
+    payload: Optional[dict] = None,
     detail_override: Optional[str] = None,
     service_override: Optional[str] = None,
 ) -> None:
     capabilities = _service_capabilities(services)
-    service = capabilities["services"].get(path, {})
+    service = _effective_service_support(services, path, payload)
     raise HTTPException(
         status_code=501,
         detail={
@@ -459,6 +540,22 @@ def _require_service_support(services: AppServices, path: str) -> None:
     service = capabilities["services"].get(path)
     if not service or not service.get("supported"):
         _raise_unsupported_capability(services, path)
+
+
+def _require_payload_service_support(
+    services: AppServices,
+    path: str,
+    payload: dict,
+) -> None:
+    service = _effective_service_support(services, path, payload)
+    if not service.get("supported"):
+        _raise_unsupported_capability(
+            services,
+            path,
+            payload=payload,
+            detail_override=service.get("detail"),
+            service_override=service.get("service"),
+        )
 
 
 def _require_multimodal_support(services: AppServices, path: str, payload: dict) -> None:
@@ -707,6 +804,7 @@ def create_app(
                 payload["reasoning_budget"] = request_model.thinking.budget_tokens
         if chat_template_kwargs:
             payload["chat_template_kwargs"] = chat_template_kwargs
+        _require_payload_service_support(services, "/v1/messages", payload)
         _require_multimodal_support(services, "/v1/messages", payload)
 
         try:
@@ -988,6 +1086,7 @@ async def _proxy_request(request: Request, services: AppServices, path: str):
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type and body:
         payload = _rewrite_model(json.loads(body), services.settings)
+        _require_payload_service_support(services, f"/{path.lstrip('/')}", payload)
         _require_multimodal_support(services, f"/{path.lstrip('/')}", payload)
         body = json.dumps(payload).encode("utf-8")
         headers["content-type"] = "application/json"

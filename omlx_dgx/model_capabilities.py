@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers for inferring multimodal model capabilities from model identifiers."""
+"""Helpers for inferring model capabilities from model identifiers."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ from typing import Dict, Optional
 
 
 @dataclass(frozen=True)
-class MultimodalCapabilities:
+class ModelCapabilities:
+    embeddings: bool = False
+    rerank: bool = False
     vision_chat: bool = False
     ocr: bool = False
 
@@ -16,8 +18,28 @@ class MultimodalCapabilities:
         return asdict(self)
 
 
-def infer_multimodal_capabilities(*refs: Optional[str]) -> MultimodalCapabilities:
+def infer_model_capabilities(*refs: Optional[str]) -> ModelCapabilities:
     normalized = " ".join(str(ref or "").lower() for ref in refs if ref)
+    embeddings = any(
+        token in normalized
+        for token in (
+            "embedding",
+            "embed",
+            "nomic-embed",
+            "bge-m3",
+            "gte-",
+            "gte_",
+        )
+    )
+    rerank = any(
+        token in normalized
+        for token in (
+            "rerank",
+            "reranker",
+            "bge-reranker",
+            "qwen3-reranker",
+        )
+    )
     ocr = any(
         token in normalized
         for token in (
@@ -40,6 +62,17 @@ def infer_multimodal_capabilities(*refs: Optional[str]) -> MultimodalCapabilitie
             "minicpm-o",
             "glm-4v",
             "pixtral",
+            "qwen3-vl",
+            "qwen3_vl",
         )
     )
-    return MultimodalCapabilities(vision_chat=vision, ocr=ocr)
+    return ModelCapabilities(
+        embeddings=embeddings,
+        rerank=rerank,
+        vision_chat=vision,
+        ocr=ocr,
+    )
+
+
+def infer_multimodal_capabilities(*refs: Optional[str]) -> ModelCapabilities:
+    return infer_model_capabilities(*refs)

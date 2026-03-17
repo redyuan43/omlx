@@ -198,3 +198,46 @@ class HttpOpenAIBackendAdapter(BackendAdapter):
             embeddings=True,
             rerank=True,
         )
+
+
+class ExternalOpenAIModelAdapter(HttpOpenAIBackendAdapter):
+    """Static-capability adapter for externally managed OpenAI-compatible models."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        target_model_name: str,
+        capabilities: BackendCapabilities,
+    ) -> None:
+        super().__init__(base_url)
+        self.target_model_name = target_model_name
+        self._capabilities = capabilities
+
+    def capabilities(self) -> BackendCapabilities:
+        return self._capabilities
+
+    def start_runtime(self) -> Dict[str, Any]:
+        return {
+            "started": self.health(),
+            "mode": "openai_compatible_external",
+            "target_model_name": self.target_model_name,
+            "managed": False,
+        }
+
+    def stop_runtime(self) -> Dict[str, Any]:
+        return {
+            "stopped": False,
+            "mode": "openai_compatible_external",
+            "target_model_name": self.target_model_name,
+            "managed": False,
+        }
+
+    def runtime_logs(self, lines: int = 40) -> Dict[str, Any]:
+        return {
+            "lines": [],
+            "path": None,
+            "mode": "openai_compatible_external",
+            "target_model_name": self.target_model_name,
+            "managed": False,
+        }

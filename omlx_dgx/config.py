@@ -8,7 +8,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from omlx_dgx.model_capabilities import infer_multimodal_capabilities
+from omlx_dgx.model_capabilities import infer_model_capabilities
 
 
 def parse_size(size_str: str) -> int:
@@ -103,6 +103,8 @@ _LEGACY_LLAMA_CPP_DEFAULTS: Dict[str, Any] = {
 class LlamaCppModelRegistration:
     model_id: str
     model_alias: Optional[str] = None
+    backend_kind: str = "llama_cpp"
+    backend_model_name: str = ""
     model_repo_id: str = ""
     artifact_path: str = ""
     gguf_variant: str = ""
@@ -114,12 +116,18 @@ class LlamaCppModelRegistration:
     pinned: bool = False
     ttl_seconds: int = 0
     idle_unload_seconds: int = 0
+    supports_embeddings: bool = False
+    supports_rerank: bool = False
     supports_vision: bool = False
     supports_ocr: bool = False
 
     def __post_init__(self) -> None:
         self.model_id = str(self.model_id or "").strip()
         self.model_alias = self.model_alias or None
+        self.backend_kind = str(self.backend_kind or "llama_cpp").strip() or "llama_cpp"
+        if self.backend_kind not in {"llama_cpp", "openai_compatible"}:
+            self.backend_kind = "llama_cpp"
+        self.backend_model_name = str(self.backend_model_name or "").strip()
         self.model_repo_id = str(self.model_repo_id or "").strip()
         self.artifact_path = str(self.artifact_path or "").strip()
         self.gguf_variant = str(self.gguf_variant or "").strip()
@@ -130,11 +138,16 @@ class LlamaCppModelRegistration:
         self.parallel_slots = max(0, int(self.parallel_slots or 0))
         self.ttl_seconds = max(0, int(self.ttl_seconds or 0))
         self.idle_unload_seconds = max(0, int(self.idle_unload_seconds or 0))
-        inferred = infer_multimodal_capabilities(
+        inferred = infer_model_capabilities(
             self.model_id,
+            self.backend_model_name,
             self.model_repo_id,
             self.artifact_path,
         )
+        self.supports_embeddings = bool(
+            self.supports_embeddings or inferred.embeddings
+        )
+        self.supports_rerank = bool(self.supports_rerank or inferred.rerank)
         self.supports_vision = bool(self.supports_vision or inferred.vision_chat)
         self.supports_ocr = bool(self.supports_ocr or inferred.ocr)
 
@@ -363,11 +376,17 @@ class ModelProfile:
     top_p: float = 0.95
     top_k: int = 0
     is_default: bool = False
+    supports_embeddings: bool = False
+    supports_rerank: bool = False
     supports_vision: bool = False
     supports_ocr: bool = False
 
     def __post_init__(self) -> None:
-        inferred = infer_multimodal_capabilities(self.model_id, self.model_alias)
+        inferred = infer_model_capabilities(self.model_id, self.model_alias)
+        self.supports_embeddings = bool(
+            self.supports_embeddings or inferred.embeddings
+        )
+        self.supports_rerank = bool(self.supports_rerank or inferred.rerank)
         self.supports_vision = bool(self.supports_vision or inferred.vision_chat)
         self.supports_ocr = bool(self.supports_ocr or inferred.ocr)
 
@@ -407,6 +426,8 @@ class DGXRuntimeConfig:
                     "max_tokens": profile.max_tokens,
                     "default": profile.is_default,
                     "capabilities": {
+                        "embeddings": profile.supports_embeddings,
+                        "rerank": profile.supports_rerank,
                         "vision_chat": profile.supports_vision,
                         "ocr": profile.supports_ocr,
                     },

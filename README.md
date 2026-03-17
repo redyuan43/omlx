@@ -60,11 +60,11 @@ conversation's warm prefix. The DGX path now also has a managed GGUF
 model-pool layer for multi-model registration, pin, TTL, idle unload, LRU
 eviction, and manual load/unload from `/admin/api/runtime/model-pool`. Phase 3
 also adds managed slot save/restore plus persisted session restore metadata in
-`/admin/api/runtime`. Phase 4 adds capability-aware `/v1/messages` handling,
-explicit unsupported-capability responses for `/v1/embeddings` and
-`/v1/rerank` on chat-only DGX backends, and stable benchmark report retrieval
-under `/admin/api/benchmarks`. The current DGX Spark defaults are split into
-two named presets:
+`/admin/api/runtime`. The DGX path now supports capability-aware
+`/v1/messages`, `/v1/embeddings`, `/v1/rerank`, VLM, and OCR routing with
+model-level gating, plus stable benchmark report retrieval under
+`/admin/api/benchmarks`. The current DGX Spark defaults are split into two
+named presets:
 
 - `single_session_low_latency` for one local long-running chat (`parallel_slots=1`, `ctx_size=32768`)
 - `mixed_traffic` for long-context + short-request concurrency (`parallel_slots=2`, `ctx_size=32768`)
