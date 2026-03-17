@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import audioop
 import io
+import os
 import queue
+import re
 import subprocess
 import tempfile
 import threading
@@ -57,6 +59,37 @@ def encode_wav_bytes(payload: WavePayload) -> bytes:
         handle.setframerate(payload.sample_rate)
         handle.writeframes(payload.frames)
     return buffer.getvalue()
+
+
+def concatenate_wav_bytes(wav_chunks: list[bytes]) -> bytes:
+    if not wav_chunks:
+        return encode_wav_bytes(
+            WavePayload(
+                sample_rate=24000,
+                channels=1,
+                sample_width=2,
+                frames=b"",
+            )
+        )
+    first = decode_wav_bytes(wav_chunks[0])
+    frames = [first.frames]
+    for chunk in wav_chunks[1:]:
+        payload = decode_wav_bytes(chunk)
+        if (
+            payload.sample_rate != first.sample_rate
+            or payload.channels != first.channels
+            or payload.sample_width != first.sample_width
+        ):
+            raise ValueError("cannot concatenate wav chunks with different formats")
+        frames.append(payload.frames)
+    return encode_wav_bytes(
+        WavePayload(
+            sample_rate=first.sample_rate,
+            channels=first.channels,
+            sample_width=first.sample_width,
+            frames=b"".join(frames),
+        )
+    )
 
 
 def convert_wav_bytes(
@@ -203,6 +236,76 @@ class PlaybackHandle:
         raise NotImplementedError
 
 
+class SequentialPlaybackHandle(PlaybackHandle):
+    def __init__(self, sink: "PlaybackSink") -> None:
+        self._sink = sink
+        self._queue: "queue.Queue[bytes | None]" = queue.Queue()
+        self._done = threading.Event()
+        self._closed = threading.Event()
+        self._started = threading.Event()
+        self._stopped = threading.Event()
+        self._lock = threading.Lock()
+        self._current: Optional[PlaybackHandle] = None
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def enqueue(self, wav_bytes: bytes) -> None:
+        if self._closed.is_set() or self._stopped.is_set():
+            return
+        self._queue.put(wav_bytes)
+
+    def close_input(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._queue.put(None)
+
+    def has_started(self) -> bool:
+        return self._started.is_set()
+
+    def is_active(self) -> bool:
+        if self._done.is_set():
+            return False
+        if self._started.is_set():
+            return True
+        return not self._closed.is_set()
+
+    def stop(self) -> None:
+        self._stopped.set()
+        with self._lock:
+            current = self._current
+        if current is not None:
+            current.stop()
+        self.close_input()
+        self._done.set()
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        return self._done.wait(timeout)
+
+    def _run(self) -> None:
+        try:
+            while not self._stopped.is_set():
+                item = self._queue.get()
+                if item is None:
+                    break
+                handle = self._sink.play(item)
+                with self._lock:
+                    self._current = handle
+                self._started.set()
+                handle.wait()
+                with self._lock:
+                    self._current = None
+                if self._stopped.is_set():
+                    break
+        finally:
+            self._done.set()
+
+
+class PlaybackSink:
+    def play(self, wav_bytes: bytes) -> PlaybackHandle:
+        raise NotImplementedError
+
+
 class SimulatedPlaybackHandle(PlaybackHandle):
     def __init__(self, duration_ms: float) -> None:
         self._duration_s = max(0.0, duration_ms / 1000.0)
@@ -266,18 +369,41 @@ class AplayPlaybackHandle(PlaybackHandle):
                 pass
 
 
-class SimulatedPlaybackSink:
+class SimulatedPlaybackSink(PlaybackSink):
     def play(self, wav_bytes: bytes) -> PlaybackHandle:
         payload = decode_wav_bytes(wav_bytes)
         return SimulatedPlaybackHandle(payload.duration_ms)
 
 
-class AplayPlaybackSink:
+class AplayPlaybackSink(PlaybackSink):
     def __init__(self, *, device: str = "") -> None:
         self.device = device
 
     def play(self, wav_bytes: bytes) -> PlaybackHandle:
         return AplayPlaybackHandle(wav_bytes, device=self.device)
+
+
+def detect_default_playback_target() -> dict[str, str]:
+    summary = {"node_name": "", "description": "", "nick": "", "alsa_name": ""}
+    try:
+        output = subprocess.check_output(
+            ["wpctl", "inspect", "@DEFAULT_AUDIO_SINK@"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return summary
+    patterns = {
+        "node_name": r"node\.name = \"([^\"]+)\"",
+        "description": r"node\.description = \"([^\"]+)\"",
+        "nick": r"node\.nick = \"([^\"]+)\"",
+        "alsa_name": r"alsa\.name = \"([^\"]+)\"",
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output)
+        if match:
+            summary[key] = match.group(1)
+    return summary
 
 
 class ARecordCaptureStream:

@@ -3,9 +3,10 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 import requests
 
@@ -83,3 +84,55 @@ class LLMChatClient:
             latency_ms=int((time.perf_counter() - request_started) * 1000),
             raw=body,
         )
+
+    def chat_stream(
+        self,
+        *,
+        model: str,
+        messages: List[Dict[str, Any]],
+        conversation_id: str,
+        system_prompt: str = "",
+    ) -> Iterator[str]:
+        payload: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": 0.2,
+            "max_tokens": 192,
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "enableThinking": False,
+            "reasoning": False,
+            "reasoning_budget": 0,
+            "reasoning_format": "none",
+            "metadata": {
+                "conversation_id": conversation_id,
+                "omlx_duplex": True,
+            },
+        }
+        if system_prompt:
+            payload["metadata"]["system_prompt_hash"] = system_prompt
+        with self.session.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=self.timeout,
+            stream=True,
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+                line = str(raw_line).strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                for choice in payload.get("choices", []):
+                    delta = choice.get("delta", {})
+                    content = str(delta.get("content", "") or "")
+                    if content:
+                        yield content

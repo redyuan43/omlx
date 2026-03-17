@@ -17,9 +17,12 @@ from .audio_io import (
     AplayPlaybackSink,
     EnergyVad,
     PlaybackHandle,
+    SequentialPlaybackHandle,
     SimulatedPlaybackSink,
+    concatenate_wav_bytes,
     convert_wav_bytes,
     encode_pcm16_mono_wav,
+    detect_default_playback_target,
 )
 from .config import DuplexConfig
 from .llm_client import LLMChatClient
@@ -27,6 +30,32 @@ from .tts_client import TtsClient
 
 
 EventCallback = Callable[[str, Dict[str, Any]], None]
+
+_SENTENCE_BREAKS = "。！？!?；;\n"
+
+
+def _drain_ready_sentences(
+    buffer: str,
+    *,
+    min_chars: int,
+    max_chars: int,
+) -> List[str]:
+    ready: List[str] = []
+    consumed = 0
+    for index, char in enumerate(buffer):
+        current = buffer[consumed : index + 1]
+        if char in _SENTENCE_BREAKS and len(current.strip()) >= min_chars:
+            ready.append(current.strip())
+            consumed = index + 1
+            continue
+        if len(current.strip()) >= max_chars and ("，" in current or "," in current or "、" in current):
+            split_at = max(current.rfind("，"), current.rfind(","), current.rfind("、"))
+            if split_at >= 0:
+                candidate = current[: split_at + 1].strip()
+                if candidate:
+                    ready.append(candidate)
+                    consumed += split_at + 1
+    return ready
 
 
 @dataclass
@@ -54,6 +83,12 @@ class DuplexTurnResult:
 class DuplexTurnContext:
     result: DuplexTurnResult
     playback: Optional[PlaybackHandle]
+    done: Optional[threading.Event] = None
+
+    def wait_complete(self, timeout: Optional[float] = None) -> bool:
+        if self.done is None:
+            return True
+        return self.done.wait(timeout)
 
 
 class DuplexSession:
@@ -174,69 +209,194 @@ class DuplexSession:
 
         with self._lock:
             self._messages.append({"role": "user", "content": asr_result.text})
-
-        llm_result = self.llm_client.chat(
-            model=self.config.services.model,
-            messages=list(self._messages),
-            conversation_id=self.conversation_id,
-            system_prompt=self.config.services.system_prompt,
-        )
-        with self._lock:
-            self._messages.append({"role": "assistant", "content": llm_result.text})
-
-        tts_result = self.tts_client.speak(
-            llm_result.text,
-            speaker=self.config.services.speaker,
-            speed=self.config.services.tts_speed,
-            trace_id=f"{self.session_id}-turn{turn_index}-tts",
-        )
         reply_audio_path = turn_dir / "assistant.wav"
-        reply_audio_path.write_bytes(tts_result.wav_bytes)
-        speak_latency_ms = int((time.perf_counter() - request_started) * 1000)
         result = DuplexTurnResult(
             turn_index=turn_index,
             prompt_label=prompt_label,
             transcript=asr_result.text,
-            reply_text=llm_result.text,
+            reply_text="",
             asr_ms=asr_result.latency_ms,
-            llm_ms=llm_result.latency_ms,
-            tts_ms=tts_result.latency_ms,
-            total_ms=speak_latency_ms,
-            speak_latency_ms=speak_latency_ms,
+            llm_ms=0,
+            tts_ms=0,
+            total_ms=0,
+            speak_latency_ms=0,
             interrupted=False,
             user_audio_path=str(user_audio_path),
             reply_audio_path=str(reply_audio_path),
             metadata={
                 "conversation_id": self.conversation_id,
                 "asr": asr_result.raw,
-                "llm": llm_result.raw,
-                "tts_duration_ms": tts_result.duration_ms,
-                "tts_worker_id": tts_result.worker_id,
+                "llm": {},
+                "tts_duration_ms": 0.0,
+                "tts_worker_id": "",
             },
         )
-        playback = self.playback_sink.play(tts_result.wav_bytes)
+        playback = SequentialPlaybackHandle(self.playback_sink)
+        done = threading.Event()
         with self._lock:
             self.turns.append(result)
             self._current_turn = result
             self._playback = playback
-            self._state = "speaking"
-        self._write_turn_metadata(result)
-        self._emit(
-            "assistant_playback_started",
-            {
-                "turn_index": turn_index,
-                "prompt_label": prompt_label,
-                "reply_text": llm_result.text,
-                "reply_audio_path": str(reply_audio_path),
-            },
-        )
-        watcher = threading.Thread(
-            target=self._watch_playback,
-            args=(playback,),
+            self._state = "thinking"
+        worker = threading.Thread(
+            target=self._generate_and_speak_turn,
+            args=(
+                turn_index,
+                prompt_label,
+                request_started,
+                result,
+                playback,
+                done,
+            ),
             daemon=True,
         )
+        worker.start()
+        watcher = threading.Thread(target=self._watch_playback, args=(playback,), daemon=True)
         watcher.start()
-        return DuplexTurnContext(result=result, playback=playback)
+        return DuplexTurnContext(result=result, playback=playback, done=done)
+
+    def _generate_and_speak_turn(
+        self,
+        turn_index: int,
+        prompt_label: str,
+        request_started: float,
+        result: DuplexTurnResult,
+        playback: SequentialPlaybackHandle,
+        done: threading.Event,
+    ) -> None:
+        wav_chunks: List[bytes] = []
+        llm_started = time.perf_counter()
+        llm_raw: Dict[str, Any] = {}
+        full_text = ""
+        first_audio_started = False
+        tts_latency_total = 0
+        tts_duration_total = 0.0
+        tts_worker_id = ""
+        buffer = ""
+        try:
+            messages_snapshot = list(self._messages)
+            if self.config.services.stream_llm:
+                for delta in self.llm_client.chat_stream(
+                    model=self.config.services.model,
+                    messages=messages_snapshot,
+                    conversation_id=self.conversation_id,
+                    system_prompt=self.config.services.system_prompt,
+                ):
+                    full_text += delta
+                    buffer += delta
+                    if result.interrupted:
+                        break
+                    for sentence in _drain_ready_sentences(
+                        buffer,
+                        min_chars=self.config.services.stream_sentence_min_chars,
+                        max_chars=self.config.services.stream_sentence_max_chars,
+                    ):
+                        buffer = buffer[len(sentence) :]
+                        chunk_result = self.tts_client.speak(
+                            sentence,
+                            speaker=self.config.services.speaker,
+                            speed=self.config.services.tts_speed,
+                            trace_id=f"{self.session_id}-turn{turn_index}-tts",
+                        )
+                        tts_latency_total += chunk_result.latency_ms
+                        tts_duration_total += chunk_result.duration_ms
+                        tts_worker_id = chunk_result.worker_id or tts_worker_id
+                        wav_chunks.append(chunk_result.wav_bytes)
+                        playback.enqueue(chunk_result.wav_bytes)
+                        if not first_audio_started:
+                            first_audio_started = True
+                            result.speak_latency_ms = int(
+                                (time.perf_counter() - request_started) * 1000
+                            )
+                            with self._lock:
+                                self._state = "speaking"
+                            self._emit(
+                                "assistant_playback_started",
+                                {
+                                    "turn_index": turn_index,
+                                    "prompt_label": prompt_label,
+                                    "reply_text": full_text.strip(),
+                                    "reply_audio_path": result.reply_audio_path,
+                                },
+                            )
+                if buffer.strip() and not result.interrupted:
+                    chunk_result = self.tts_client.speak(
+                        buffer.strip(),
+                        speaker=self.config.services.speaker,
+                        speed=self.config.services.tts_speed,
+                        trace_id=f"{self.session_id}-turn{turn_index}-tts-final",
+                    )
+                    tts_latency_total += chunk_result.latency_ms
+                    tts_duration_total += chunk_result.duration_ms
+                    tts_worker_id = chunk_result.worker_id or tts_worker_id
+                    wav_chunks.append(chunk_result.wav_bytes)
+                    playback.enqueue(chunk_result.wav_bytes)
+                    if not first_audio_started:
+                        first_audio_started = True
+                        result.speak_latency_ms = int(
+                            (time.perf_counter() - request_started) * 1000
+                        )
+                        with self._lock:
+                            self._state = "speaking"
+                        self._emit(
+                            "assistant_playback_started",
+                            {
+                                "turn_index": turn_index,
+                                "prompt_label": prompt_label,
+                                "reply_text": full_text.strip(),
+                                "reply_audio_path": result.reply_audio_path,
+                            },
+                        )
+                result.llm_ms = int((time.perf_counter() - llm_started) * 1000)
+                llm_raw = {"streamed": True}
+            else:
+                llm_result = self.llm_client.chat(
+                    model=self.config.services.model,
+                    messages=messages_snapshot,
+                    conversation_id=self.conversation_id,
+                    system_prompt=self.config.services.system_prompt,
+                )
+                full_text = llm_result.text
+                result.llm_ms = llm_result.latency_ms
+                llm_raw = llm_result.raw
+                chunk_result = self.tts_client.speak(
+                    full_text,
+                    speaker=self.config.services.speaker,
+                    speed=self.config.services.tts_speed,
+                    trace_id=f"{self.session_id}-turn{turn_index}-tts",
+                )
+                tts_latency_total += chunk_result.latency_ms
+                tts_duration_total += chunk_result.duration_ms
+                tts_worker_id = chunk_result.worker_id or tts_worker_id
+                wav_chunks.append(chunk_result.wav_bytes)
+                playback.enqueue(chunk_result.wav_bytes)
+                result.speak_latency_ms = int((time.perf_counter() - request_started) * 1000)
+                with self._lock:
+                    self._state = "speaking"
+                self._emit(
+                    "assistant_playback_started",
+                    {
+                        "turn_index": turn_index,
+                        "prompt_label": prompt_label,
+                        "reply_text": full_text.strip(),
+                        "reply_audio_path": result.reply_audio_path,
+                    },
+                )
+
+            result.reply_text = full_text.strip()
+            result.tts_ms = tts_latency_total
+            result.total_ms = int((time.perf_counter() - request_started) * 1000)
+            result.metadata["llm"] = llm_raw
+            result.metadata["tts_duration_ms"] = tts_duration_total
+            result.metadata["tts_worker_id"] = tts_worker_id
+            with self._lock:
+                self._messages.append({"role": "assistant", "content": result.reply_text})
+            if wav_chunks:
+                Path(result.reply_audio_path).write_bytes(concatenate_wav_bytes(wav_chunks))
+            self._write_turn_metadata(result)
+        finally:
+            playback.close_input()
+            done.set()
 
     def _watch_playback(self, playback: PlaybackHandle) -> None:
         playback.wait()
@@ -343,10 +503,20 @@ class DuplexLiveRunner:
         context = self.session.submit_user_audio(wav_bytes, prompt_label=prompt_label)
         result = context.result
         print(f"user> {result.transcript}")
+        threading.Thread(
+            target=self._announce_completion,
+            args=(context,),
+            daemon=True,
+        ).start()
+
+    def _announce_completion(self, context: DuplexTurnContext) -> None:
+        context.wait_complete(timeout=max(30.0, self.config.services.request_timeout_s))
+        result = context.result
         print(f"assistant> {result.reply_text}")
         print(
             f"[speaking] asr={result.asr_ms}ms llm={result.llm_ms}ms "
-            f"tts={result.tts_ms}ms total={result.total_ms}ms"
+            f"tts={result.tts_ms}ms first_audio={result.speak_latency_ms}ms "
+            f"total={result.total_ms}ms"
         )
 
 

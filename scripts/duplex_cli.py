@@ -9,6 +9,7 @@ import argparse
 from omlx_dgx.duplex.asr_client import AsrClient
 from omlx_dgx.duplex.config import DuplexConfig
 from omlx_dgx.duplex.llm_client import LLMChatClient
+from omlx_dgx.duplex.audio_io import detect_default_playback_target
 from omlx_dgx.duplex.session import DuplexLiveRunner, DuplexSession, default_playback_sink
 from omlx_dgx.duplex.tts_client import TtsClient
 
@@ -46,6 +47,13 @@ def main() -> int:
     config.audio.interrupt_vad_threshold = args.vad_threshold * 0.9
     config.audio.vad_start_ms = args.vad_start_ms
     config.audio.vad_stop_ms = args.vad_stop_ms
+
+    sink = detect_default_playback_target()
+    if sink.get("description") or sink.get("nick"):
+        print(
+            "[audio] default_sink="
+            + (sink.get("nick") or sink.get("description") or sink.get("node_name") or "unknown")
+        )
 
     session = DuplexSession(
         config=config,

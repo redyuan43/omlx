@@ -282,10 +282,12 @@ class DuplexSelfTester:
         *,
         bootstrap_omlx: bool = True,
         real_playback: bool = False,
+        play_user_prompts: bool = False,
     ) -> None:
         self.config = config
         self.bootstrap_omlx = bootstrap_omlx
         self.real_playback = real_playback
+        self.play_user_prompts = play_user_prompts
         self.runtime_root = config.runtime_path()
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.managed_server: Optional[ManagedOmlxServer] = None
@@ -353,6 +355,12 @@ class DuplexSelfTester:
                     step.prompt_text,
                     trace_id=f"{session.session_id}-{step.name}-prompt",
                 )
+                prompt_playback = None
+                if self.real_playback and self.play_user_prompts:
+                    prompt_playback = default_playback_sink(
+                        simulated=False,
+                        device=self.config.audio.playback_device,
+                    ).play(prompt_audio)
                 if step.trigger == "after_assistant_start":
                     if previous_context is None or previous_context.playback is None:
                         raise RuntimeError("interrupt step requires an active previous playback")
@@ -363,6 +371,9 @@ class DuplexSelfTester:
                         time.sleep(step.trigger_playback_active_ms / 1000.0)
                     session.interrupt_playback(reason="selftest_barge_in")
                 context = session.submit_user_audio(prompt_audio, prompt_label=step.name)
+                if prompt_playback is not None and step.trigger != "after_assistant_start":
+                    prompt_playback.wait(timeout=15.0)
+                context.wait_complete(timeout=max(30.0, self.config.services.request_timeout_s))
                 result = context.result
                 assistant_audio = Path(result.reply_audio_path).read_bytes()
                 assistant_transcript = self.transcribe_assistant_audio(
@@ -463,6 +474,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speaker", default="")
     parser.add_argument("--playback-device", default="")
     parser.add_argument("--real-playback", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--play-user-prompts", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--bootstrap-omlx", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--scenario", action="append", default=[])
     return parser
@@ -482,6 +494,7 @@ def main() -> int:
         config,
         bootstrap_omlx=bool(args.bootstrap_omlx),
         real_playback=bool(args.real_playback),
+        play_user_prompts=bool(args.play_user_prompts),
     )
     payload = tester.run(scenarios=args.scenario or None)
     print(json.dumps(payload, ensure_ascii=False, indent=2))

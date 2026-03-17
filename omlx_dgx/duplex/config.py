@@ -36,6 +36,10 @@ class DuplexServiceConfig:
     )
     tts_speed: float = 1.0
     request_timeout_s: float = 180.0
+    stream_llm: bool = True
+    segment_tts: bool = True
+    stream_sentence_min_chars: int = 12
+    stream_sentence_max_chars: int = 80
 
 
 @dataclass
@@ -53,6 +57,7 @@ class DuplexConfig:
     audio: DuplexAudioConfig = field(default_factory=DuplexAudioConfig)
     services: DuplexServiceConfig = field(default_factory=DuplexServiceConfig)
     selftest: DuplexSelfTestThresholds = field(default_factory=DuplexSelfTestThresholds)
+    selftest_play_user_prompts: bool = True
 
     def runtime_path(self) -> Path:
         return Path(self.runtime_dir).expanduser()
