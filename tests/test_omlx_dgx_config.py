@@ -5,6 +5,7 @@ from pathlib import Path
 import omlx_dgx.cli as cli
 from omlx_dgx.config import (
     DGXSettingsManager,
+    LlamaCppModelRegistration,
     ModelProfile,
     RECOMMENDED_LLAMA_CPP_GGUF_MODEL_REPO_ID,
     RECOMMENDED_LLAMA_CPP_GGUF_VARIANT,
@@ -42,6 +43,8 @@ def test_settings_manager_persists_default_model(tmp_path: Path):
     assert reloaded.config.backend.slot_prompt_similarity == 0.10
     assert reloaded.config.backend.enable_runtime_metrics is False
     assert reloaded.config.backend.enable_session_stickiness is True
+    assert reloaded.config.backend.enable_session_restore is True
+    assert reloaded.config.backend.session_restore_min_prompt_tokens == 0
     assert reloaded.config.backend.sticky_session_prompt_threshold == 2048
     assert reloaded.config.backend.sticky_max_sessions == 256
     assert reloaded.config.backend.split_mode == "row"
@@ -61,6 +64,52 @@ def test_settings_manager_persists_default_model(tmp_path: Path):
         ]
         is True
     )
+    assert reloaded.config.backend.model_pool.max_loaded_models == 2
+    assert reloaded.config.backend.model_pool.models == {}
+
+
+def test_settings_manager_persists_llama_cpp_model_pool_registration(tmp_path: Path):
+    manager = DGXSettingsManager(tmp_path)
+    manager.ensure_llama_cpp_model_registration(
+        LlamaCppModelRegistration(
+            model_id="qwen35-4b-secondary",
+            model_alias="qwen35-secondary",
+            artifact_path="/models/Qwen3.5-4B-Q4_K_S.gguf",
+            base_url="http://127.0.0.1:32121",
+            gguf_variant="Q4_K_S",
+            pinned=False,
+            ttl_seconds=900,
+            idle_unload_seconds=120,
+            supports_vision=True,
+        ),
+        profile=ModelProfile(
+            model_id="qwen35-4b-secondary",
+            model_alias="qwen35-secondary",
+            supports_vision=True,
+        ),
+    )
+
+    reloaded = DGXSettingsManager(tmp_path)
+    registration = reloaded.config.backend.model_pool.models["qwen35-4b-secondary"]
+
+    assert reloaded.config.resolve_model_id("qwen35-secondary") == "qwen35-4b-secondary"
+    assert registration.artifact_path == "/models/Qwen3.5-4B-Q4_K_S.gguf"
+    assert registration.base_url == "http://127.0.0.1:32121"
+    assert registration.gguf_variant == "Q4_K_S"
+    assert registration.ttl_seconds == 900
+    assert registration.idle_unload_seconds == 120
+    assert registration.supports_vision is True
+    assert reloaded.config.public_models()[0]["capabilities"]["vision_chat"] is True
+
+
+def test_model_profile_infers_multimodal_capabilities_from_name():
+    profile = ModelProfile(model_id="Qwen3-VL-8B-Instruct", model_alias="qwen3-vl")
+    assert profile.supports_vision is True
+    assert profile.supports_ocr is False
+
+    ocr_profile = ModelProfile(model_id="GLM-OCR")
+    assert ocr_profile.supports_vision is True
+    assert ocr_profile.supports_ocr is True
 
 
 def test_manifest_store_round_trip(tmp_path: Path):

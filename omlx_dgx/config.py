@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from omlx_dgx.model_capabilities import infer_multimodal_capabilities
+
 
 def parse_size(size_str: str) -> int:
     """Parse a human-readable size string to bytes."""
@@ -39,6 +41,8 @@ LLAMA_CPP_SERVING_PRESETS: Dict[str, Dict[str, Any]] = {
         "slot_prompt_similarity": 0.10,
         "enable_runtime_metrics": True,
         "enable_session_stickiness": True,
+        "enable_session_restore": True,
+        "session_restore_min_prompt_tokens": 0,
         "sticky_session_prompt_threshold": 2048,
         "sticky_max_sessions": 256,
         "split_mode": "row",
@@ -58,6 +62,8 @@ LLAMA_CPP_SERVING_PRESETS: Dict[str, Dict[str, Any]] = {
         "slot_prompt_similarity": 0.10,
         "enable_runtime_metrics": True,
         "enable_session_stickiness": True,
+        "enable_session_restore": True,
+        "session_restore_min_prompt_tokens": 0,
         "sticky_session_prompt_threshold": 2048,
         "sticky_max_sessions": 256,
         "split_mode": "row",
@@ -82,6 +88,8 @@ _LEGACY_LLAMA_CPP_DEFAULTS: Dict[str, Any] = {
     "ctx_checkpoints": 32,
     "enable_runtime_metrics": False,
     "enable_session_stickiness": True,
+    "enable_session_restore": True,
+    "session_restore_min_prompt_tokens": 0,
     "sticky_session_prompt_threshold": 2048,
     "sticky_max_sessions": 256,
     "split_mode": "row",
@@ -89,6 +97,92 @@ _LEGACY_LLAMA_CPP_DEFAULTS: Dict[str, Any] = {
     "jinja": True,
     "reasoning_format": "deepseek",
 }
+
+
+@dataclass
+class LlamaCppModelRegistration:
+    model_id: str
+    model_alias: Optional[str] = None
+    model_repo_id: str = ""
+    artifact_path: str = ""
+    gguf_variant: str = ""
+    base_url: str = ""
+    launcher_cmd: str = ""
+    serving_preset: str = ""
+    ctx_size: int = 0
+    parallel_slots: int = 0
+    pinned: bool = False
+    ttl_seconds: int = 0
+    idle_unload_seconds: int = 0
+    supports_vision: bool = False
+    supports_ocr: bool = False
+
+    def __post_init__(self) -> None:
+        self.model_id = str(self.model_id or "").strip()
+        self.model_alias = self.model_alias or None
+        self.model_repo_id = str(self.model_repo_id or "").strip()
+        self.artifact_path = str(self.artifact_path or "").strip()
+        self.gguf_variant = str(self.gguf_variant or "").strip()
+        self.base_url = str(self.base_url or "").strip()
+        self.launcher_cmd = str(self.launcher_cmd or "").strip()
+        self.serving_preset = str(self.serving_preset or "").strip()
+        self.ctx_size = max(0, int(self.ctx_size or 0))
+        self.parallel_slots = max(0, int(self.parallel_slots or 0))
+        self.ttl_seconds = max(0, int(self.ttl_seconds or 0))
+        self.idle_unload_seconds = max(0, int(self.idle_unload_seconds or 0))
+        inferred = infer_multimodal_capabilities(
+            self.model_id,
+            self.model_repo_id,
+            self.artifact_path,
+        )
+        self.supports_vision = bool(self.supports_vision or inferred.vision_chat)
+        self.supports_ocr = bool(self.supports_ocr or inferred.ocr)
+
+    @classmethod
+    def from_dict(
+        cls,
+        model_id: str,
+        payload: Dict[str, Any],
+    ) -> "LlamaCppModelRegistration":
+        data = dict(payload)
+        data.setdefault("model_id", model_id)
+        return cls(**data)
+
+
+@dataclass
+class LlamaCppModelPoolConfig:
+    max_loaded_models: int = 2
+    default_ttl_seconds: int = 0
+    default_idle_unload_seconds: int = 0
+    models: Dict[str, LlamaCppModelRegistration] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.max_loaded_models = max(1, int(self.max_loaded_models or 1))
+        self.default_ttl_seconds = max(0, int(self.default_ttl_seconds or 0))
+        self.default_idle_unload_seconds = max(
+            0,
+            int(self.default_idle_unload_seconds or 0),
+        )
+        normalized: Dict[str, LlamaCppModelRegistration] = {}
+        for model_id, registration in self.models.items():
+            if isinstance(registration, LlamaCppModelRegistration):
+                normalized[model_id] = registration
+            elif isinstance(registration, dict):
+                normalized[model_id] = LlamaCppModelRegistration.from_dict(
+                    model_id,
+                    registration,
+                )
+        self.models = normalized
+
+    @classmethod
+    def from_dict(cls, payload: Dict[str, Any]) -> "LlamaCppModelPoolConfig":
+        data = dict(payload)
+        data["models"] = {
+            model_id: LlamaCppModelRegistration.from_dict(model_id, registration)
+            for model_id, registration in dict(payload.get("models", {})).items()
+            if isinstance(registration, dict)
+        }
+        return cls(**data)
 
 
 def apply_llama_cpp_serving_preset(
@@ -161,6 +255,8 @@ class BackendConfig:
     slot_prompt_similarity: float = 0.10
     enable_runtime_metrics: bool = False
     enable_session_stickiness: bool = True
+    enable_session_restore: bool = True
+    session_restore_min_prompt_tokens: int = 0
     sticky_session_prompt_threshold: int = 2048
     sticky_max_sessions: int = 256
     split_mode: str = "row"
@@ -201,6 +297,7 @@ class BackendConfig:
             "hicache_storage_pass_prefix_keys": True,
         }
     )
+    model_pool: LlamaCppModelPoolConfig = field(default_factory=LlamaCppModelPoolConfig)
     admin_api_key: str = "omlx-dgx-admin"
 
     def __post_init__(self) -> None:
@@ -222,6 +319,10 @@ class BackendConfig:
             self.model_source = "gguf"
         elif self.quant_mode == "lmstudio_baseline" and self.model_source == "hf":
             self.model_source = "lmstudio_api"
+        if isinstance(self.model_pool, dict):
+            self.model_pool = LlamaCppModelPoolConfig.from_dict(self.model_pool)
+        elif not isinstance(self.model_pool, LlamaCppModelPoolConfig):
+            self.model_pool = LlamaCppModelPoolConfig()
         if self.serving_preset and self.serving_preset not in LLAMA_CPP_SERVING_PRESETS:
             self.serving_preset = ""
         if should_auto_upgrade_llama_cpp_defaults(self):
@@ -262,6 +363,13 @@ class ModelProfile:
     top_p: float = 0.95
     top_k: int = 0
     is_default: bool = False
+    supports_vision: bool = False
+    supports_ocr: bool = False
+
+    def __post_init__(self) -> None:
+        inferred = infer_multimodal_capabilities(self.model_id, self.model_alias)
+        self.supports_vision = bool(self.supports_vision or inferred.vision_chat)
+        self.supports_ocr = bool(self.supports_ocr or inferred.ocr)
 
     def api_name(self) -> str:
         return self.model_alias or self.model_id
@@ -298,6 +406,10 @@ class DGXRuntimeConfig:
                     "max_context_window": profile.max_context_window,
                     "max_tokens": profile.max_tokens,
                     "default": profile.is_default,
+                    "capabilities": {
+                        "vision_chat": profile.supports_vision,
+                        "ocr": profile.supports_ocr,
+                    },
                 }
             )
         return result
@@ -325,6 +437,11 @@ class DGXRuntimeConfig:
             )
         if "chunked_prefill_size" not in backend_data and "fixed_chunked_prefill_size" in backend_data:
             backend_data["chunked_prefill_size"] = backend_data["fixed_chunked_prefill_size"]
+        model_pool_data = backend_data.get("model_pool")
+        if isinstance(model_pool_data, dict):
+            backend_data["model_pool"] = LlamaCppModelPoolConfig.from_dict(
+                model_pool_data
+            )
         models = {
             model_id: ModelProfile(**profile)
             for model_id, profile in data.get("models", {}).items()
@@ -364,4 +481,20 @@ class DGXSettingsManager:
             for model_id, existing in self.config.models.items():
                 if model_id != profile.model_id:
                     existing.is_default = False
+        self.save()
+
+    def ensure_llama_cpp_model_registration(
+        self,
+        registration: LlamaCppModelRegistration,
+        *,
+        profile: Optional[ModelProfile] = None,
+    ) -> None:
+        pool = self.config.backend.model_pool
+        pool.models[registration.model_id] = registration
+        if profile is not None:
+            self.config.models[profile.model_id] = profile
+            if profile.is_default:
+                for model_id, existing in self.config.models.items():
+                    if model_id != profile.model_id:
+                        existing.is_default = False
         self.save()

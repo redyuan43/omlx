@@ -18,8 +18,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from omlx_dgx.config import BackendConfig
+from omlx_dgx.model_capabilities import infer_multimodal_capabilities
 
-from .backend import BackendError, HttpOpenAIBackendAdapter, RuntimeMetrics
+from .backend import (
+    BackendCapabilities,
+    BackendError,
+    HttpOpenAIBackendAdapter,
+    RuntimeMetrics,
+)
 
 
 def _stringify_command(args: List[str]) -> str:
@@ -738,3 +744,12 @@ class SGLangBackendAdapter(HttpOpenAIBackendAdapter):
             ),
             "hicache_storage_backend": server_info.get("hicache_storage_backend"),
         }
+
+    def capabilities(self) -> BackendCapabilities:
+        multimodal = infer_multimodal_capabilities(self.config.model_repo_id)
+        return BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            vision_chat=multimodal.vision_chat,
+            ocr=multimodal.ocr,
+        )

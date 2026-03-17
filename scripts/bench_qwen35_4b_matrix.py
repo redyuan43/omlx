@@ -28,6 +28,8 @@ def _summarize(payload: Dict[str, Any]) -> Dict[str, Any]:
     long_prefix_2 = payload.get("long_prefix_run_2", {})
     long_output = payload.get("long_output_chat", {})
     followup = payload.get("single_session_followup", {}).get("summary", {})
+    recovery = payload.get("single_session_recovery", {}).get("summary", {})
+    benchmark_context = payload.get("benchmark_context", {})
     runtime_summary = payload.get("runtime_summary", {})
     telemetry = runtime_summary.get("telemetry", {})
     summary = {
@@ -39,6 +41,8 @@ def _summarize(payload: Dict[str, Any]) -> Dict[str, Any]:
         "loaded_context_length": runtime_summary.get("loaded_context_length"),
         "ctx_size": runtime_summary.get("ctx_size"),
         "parallel_slots": runtime_summary.get("parallel_slots"),
+        "benchmark_context_effective_tokens": benchmark_context.get("effective_context_tokens"),
+        "long_prefix_estimated_tokens": benchmark_context.get("long_prefix_estimated_tokens"),
         "telemetry_gpu_metrics_ok": telemetry.get("gpu_metrics_ok"),
         "telemetry_gpu_metrics_error": telemetry.get("gpu_metrics_error"),
         "short_chat_wall_time_sec": payload.get("short_chat", {}).get("wall_time_sec"),
@@ -53,6 +57,15 @@ def _summarize(payload: Dict[str, Any]) -> Dict[str, Any]:
         "long_prefix_run_1_sec": long_prefix_1.get("wall_time_sec"),
         "long_prefix_run_2_sec": long_prefix_2.get("wall_time_sec"),
         "cached_prompt_tokens_run_2": long_prefix_2.get("cached_prompt_tokens"),
+        "cold_long_prefill_sec": recovery.get("turn1_cold_long_sec"),
+        "post_restart_followup_sec": recovery.get("turn3_post_restart_followup_sec"),
+        "post_restore_followup_sec": recovery.get("turn4_post_restore_followup_sec"),
+        "recovery_replay_sec": recovery.get("turn3_recovery_replay_sec"),
+        "post_recovery_followup_sec": recovery.get("turn4_post_recovery_followup_sec"),
+        "recovery_reason": recovery.get("turn3_recovery_reason"),
+        "restore_status": recovery.get("turn3_restore_status"),
+        "restore_ms": recovery.get("turn3_restore_ms"),
+        "cold_to_restored_speedup_x": recovery.get("cold_to_restored_speedup_x"),
         "runtime_memory_after_long_prefix_run_2": long_prefix_2.get("runtime_memory_after"),
     }
     if long_prefix_1.get("wall_time_sec") and long_prefix_2.get("wall_time_sec"):
@@ -66,7 +79,9 @@ def _summarize(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _summarize_concurrency(payload: Dict[str, Any]) -> Dict[str, Any]:
     repeat = payload.get("repeat_long_prefix_plus_short", {})
     parallel = repeat.get("parallel", {})
+    benchmark_context = payload.get("benchmark_context", {})
     return {
+        "benchmark_context_effective_tokens": benchmark_context.get("effective_context_tokens"),
         "dual_short_makespan_sec": payload.get("dual_short_independent", {}).get("makespan_sec"),
         "dual_long_output_makespan_sec": payload.get("dual_long_output_independent", {}).get("makespan_sec"),
         "dual_long_output_aggregate_token_per_second": payload.get("dual_long_output_independent", {}).get(
@@ -172,8 +187,9 @@ def main() -> None:
         default=[],
         help="LABEL,LMSTUDIO_URL,MODEL",
     )
-    parser.add_argument("--long-prefix-repeat", type=int, default=300)
+    parser.add_argument("--long-prefix-repeat", type=int, default=0)
     parser.add_argument("--long-output-max-tokens", type=int, default=192)
+    parser.add_argument("--target-context-tokens", type=int, default=65536)
     parser.add_argument("--prefix-salt", default="")
     parser.add_argument("--include-concurrency", action="store_true")
     args = parser.parse_args()
@@ -193,6 +209,8 @@ def main() -> None:
             str(args.long_prefix_repeat),
             "--long-output-max-tokens",
             str(args.long_output_max_tokens),
+            "--target-context-tokens",
+            str(args.target_context_tokens),
         ]
         if args.prefix_salt:
             command.extend(["--prefix-salt", f"{args.prefix_salt}-{label}"])
@@ -209,6 +227,8 @@ def main() -> None:
                 str(args.long_prefix_repeat),
                 "--long-output-max-tokens",
                 str(args.long_output_max_tokens),
+                "--target-context-tokens",
+                str(args.target_context_tokens),
             ]
             if args.prefix_salt:
                 concurrency_command.extend(

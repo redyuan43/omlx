@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from omlx_dgx.runtime.adaptive import AdaptiveBackendAdapter, derive_secondary_base_url
-from omlx_dgx.runtime.backend import BackendAdapter, RuntimeMetrics
+from omlx_dgx.runtime.backend import BackendAdapter, BackendCapabilities, RuntimeMetrics
 
 
 @dataclass
@@ -44,6 +44,13 @@ class _FakeBackend(BackendAdapter):
 
     def runtime_logs(self, lines: int = 40) -> dict:
         return {"lines": [f"{self.name}-log"], "lines_requested": lines}
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            embeddings=(self.name == "primary"),
+        )
 
 
 def test_derive_secondary_base_url_increments_port():
@@ -121,3 +128,22 @@ def test_adaptive_backend_lifecycle_is_aggregated():
     assert logs["backends"]["secondary"]["lines"] == ["secondary-log"]
     assert stopped["backends"]["primary"]["stopped"] is True
     assert stopped["backends"]["secondary"]["stopped"] is True
+
+
+def test_adaptive_backend_capabilities_follow_routing_contract():
+    adapter = AdaptiveBackendAdapter(
+        primary=_FakeBackend("primary"),
+        secondary=_FakeBackend("secondary"),
+        primary_url="http://127.0.0.1:31000",
+        secondary_url="http://127.0.0.1:31001",
+        primary_chunked_prefill_size=8192,
+        secondary_chunked_prefill_size=1024,
+        short_prompt_threshold=100,
+    )
+
+    capabilities = adapter.capabilities()
+
+    assert capabilities.chat_completions is True
+    assert capabilities.completions is True
+    assert capabilities.embeddings is True
+    assert capabilities.rerank is False

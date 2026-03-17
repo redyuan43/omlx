@@ -12,7 +12,7 @@ from urllib.parse import ParseResult, urlparse
 
 import requests
 
-from .backend import BackendAdapter, BackendError, RuntimeMetrics
+from .backend import BackendAdapter, BackendCapabilities, BackendError, RuntimeMetrics
 
 
 def derive_secondary_base_url(base_url: str) -> str:
@@ -386,3 +386,15 @@ class AdaptiveBackendAdapter(BackendAdapter):
                 "secondary": self.secondary.cache_report(),
             },
         }
+
+    def capabilities(self) -> BackendCapabilities:
+        primary = self.primary.capabilities()
+        secondary = self.secondary.capabilities()
+        return BackendCapabilities(
+            chat_completions=primary.chat_completions and secondary.chat_completions,
+            completions=primary.completions and secondary.completions,
+            embeddings=primary.embeddings,
+            rerank=primary.rerank,
+            vision_chat=primary.vision_chat and secondary.vision_chat,
+            ocr=primary.ocr and secondary.ocr,
+        )

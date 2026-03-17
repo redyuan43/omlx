@@ -57,6 +57,19 @@ class RuntimeMetrics:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class BackendCapabilities:
+    chat_completions: bool = False
+    completions: bool = False
+    embeddings: bool = False
+    rerank: bool = False
+    vision_chat: bool = False
+    ocr: bool = False
+
+    def to_dict(self) -> Dict[str, bool]:
+        return asdict(self)
+
+
 class BackendAdapter(ABC):
     """Backend contract used by the DGX control-plane."""
 
@@ -75,6 +88,9 @@ class BackendAdapter(ABC):
     @abstractmethod
     def collect_metrics(self) -> RuntimeMetrics:
         raise NotImplementedError
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities()
 
     def start_runtime(self) -> Dict[str, Any]:
         raise BackendError("runtime start is not supported by this adapter")
@@ -174,3 +190,11 @@ class HttpOpenAIBackendAdapter(BackendAdapter):
             telemetry["gpu_metrics_error"] = str(exc)
         metrics.details = {"telemetry": telemetry}
         return metrics
+
+    def capabilities(self) -> BackendCapabilities:
+        return BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            embeddings=True,
+            rerank=True,
+        )

@@ -20,8 +20,14 @@ from typing import Any, Dict, List, Optional
 from huggingface_hub import hf_hub_download
 
 from omlx_dgx.config import BackendConfig
+from omlx_dgx.model_capabilities import infer_multimodal_capabilities
 
-from .backend import BackendError, HttpOpenAIBackendAdapter, RuntimeMetrics
+from .backend import (
+    BackendCapabilities,
+    BackendError,
+    HttpOpenAIBackendAdapter,
+    RuntimeMetrics,
+)
 
 
 @dataclass
@@ -259,8 +265,6 @@ class TensorRTLLMDirectRunner:
 
         os.environ.setdefault("TLLM_USE_TRT_ENGINE", "1")
 
-        llm_cls, sampling_cls = self._load_llm_symbols()
-
         model_ref = self.config.model_repo_id or self.config.engine_dir
         if not model_ref:
             raise BackendError("model_repo_id or engine_dir must be configured for direct API")
@@ -268,6 +272,8 @@ class TensorRTLLMDirectRunner:
         preflight = self.model_preflight()
         if not preflight["supported"]:
             raise BackendError(preflight["reason"])
+
+        llm_cls, sampling_cls = self._load_llm_symbols()
 
         self._llm = llm_cls(model=model_ref)
         self._sampling_params_cls = sampling_cls
@@ -506,15 +512,27 @@ class TensorRTLLMBackendAdapter(HttpOpenAIBackendAdapter):
             return ""
 
     def _direct_api_probe(self) -> Dict[str, Any]:
-        available = importlib.util.find_spec("tensorrt_llm") is not None
-        engine_available = importlib.util.find_spec("tensorrt_llm._tensorrt_engine") is not None
+        spec_error = ""
+        try:
+            available = importlib.util.find_spec("tensorrt_llm") is not None
+        except Exception as exc:
+            available = False
+            spec_error = f"{exc.__class__.__name__}: {exc}"
+        try:
+            engine_available = (
+                importlib.util.find_spec("tensorrt_llm._tensorrt_engine") is not None
+            )
+        except Exception as exc:
+            engine_available = False
+            if not spec_error:
+                spec_error = f"{exc.__class__.__name__}: {exc}"
         if not available:
             return {
                 "available": False,
                 "importable": False,
                 "has_llm": False,
                 "has_sampling_params": False,
-                "error": "",
+                "error": spec_error,
                 "engine_available": engine_available,
             }
 
@@ -668,6 +686,15 @@ class TensorRTLLMBackendAdapter(HttpOpenAIBackendAdapter):
         payload = self.process_manager.logs(lines=lines)
         payload["diagnostics"] = self.diagnostics().to_dict()
         return payload
+
+    def capabilities(self) -> BackendCapabilities:
+        multimodal = infer_multimodal_capabilities(self.config.model_repo_id)
+        return BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            vision_chat=multimodal.vision_chat,
+            ocr=multimodal.ocr,
+        )
 
     @classmethod
     def from_backend_config(cls, config: BackendConfig, base_path: Path) -> "TensorRTLLMBackendAdapter":

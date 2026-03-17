@@ -1,0 +1,4 @@
+interface:
+  display_name: "oMLX DGX Phase Executor"
+  short_description: "Run one DGX Spark optimization phase at a time"
+  default_prompt: "Read the repo-specific DGX skill, then execute exactly one plans/codex-phase-N.md task in /home/dgx/github/omlx. Stay within the allowed scope, run the required tests and benchmarks, and finish with Changes, Benchmarks, Known Issues, and Next-Phase Recommendation."

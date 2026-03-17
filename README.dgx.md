@@ -7,9 +7,13 @@ runtime path:
 - Managed SGLang runtime adapter with HiCache status/attach/detach support
 - Experimental TensorRT-LLM adapter kept as a research backend
 - Managed `llama.cpp` GGUF runtime for `Qwen3.5-4B`
+- Managed `llama.cpp` GGUF model pool with pin/TTL/idle unload/LRU/manual load-unload control
+- Managed `llama.cpp` session restore via slot save/restore plus persisted cold metadata snapshots
 - Backend-agnostic block metadata and scheduler policy ported from oMLX ideas
 - Tiered KV manifest store with cross-restart SSD metadata persistence
-- OpenAI-compatible HTTP proxy endpoints for `/v1/chat/completions` and `/v1/completions`
+- Capability-aware HTTP service endpoints for `/v1/chat/completions`,
+  `/v1/completions`, and `/v1/messages`, plus explicit unsupported-capability
+  responses for `/v1/embeddings` and `/v1/rerank` on chat-only backends
 - A minimal web console at `/admin`
 
 ## Quick Start
@@ -39,8 +43,31 @@ repo is:
 - `mixed_traffic` preset for long-context + short-request concurrency
 - `ctx_size=32768` as the current DGX Spark default for llama.cpp presets
 
+For deeper single-session benchmarking, keep the preset defaults above but
+launch an explicit `ctx_size=65536` service. The current benchmark scripts now
+auto-target the runtime's effective context window and leave enough headroom
+for follow-up turns and short-restart recovery.
+
+Phase 4 also makes benchmark reports available through stable admin APIs:
+
+- `GET /admin/api/runtime/capabilities`
+- `GET /admin/api/benchmarks`
+- `POST /admin/api/benchmarks/qwen35-4b/run`
+- `GET /admin/api/benchmarks/qwen35-4b/latest`
+- `GET /admin/api/benchmarks/qwen35-4b/reports`
+
 This keeps the original oMLX idea at the control-plane layer: do not let short
 requests blow away a long conversation's warm prefix.
+
+Phase 2 also adds a DGX-side GGUF model pool on top of the managed
+`llama.cpp` path:
+
+- multi-model registration persisted under `settings.json`
+- per-model pin, TTL, and idle unload policy
+- LRU eviction when the pool is at capacity
+- manual load/unload/pin admin actions
+- `/admin/api/runtime/model-pool` diagnostics showing loaded state, last use,
+  pin state, TTL/idle policy, and unload/eviction reasons
 
 ## Measured Advantages
 
@@ -53,6 +80,30 @@ repeat turns:
 - long prefix first run: `1.566s`
 - same long prefix second run: `0.070s`
 - repeat speedup: `22.37x`
+
+### 64k Extension And Recovery
+
+On the current Phase 3 `Q4_K_M` path, a managed single-session service with
+`ctx_size=65536` now persists a cold metadata snapshot for the warm chat and
+restores the saved llama.cpp slot after a short managed restart:
+
+- benchmark target context: `65536`
+- runtime-reported cold long prompt: `56200` prompt tokens
+- cold long-prefix run: `40.334s`
+- repeated long-prefix run: `1.134s`
+- repeat speedup: `35.57x`
+- warm follow-up before restart: `0.307s`
+- post-restart restored follow-up: `3.285s`
+- slot restore RPC: `7.101ms`
+- post-restore next follow-up: `0.185s`
+- cold-to-restored speedup: `12.03x`
+
+This is not GGUF block-level KV restore. It is managed slot save/restore plus
+persisted continuation metadata, with safe fallback back to cold replay if the
+saved slot cannot be restored.
+
+For the latest same-artifact comparison against the local `LM Studio` baseline,
+see [README.lmstudio-comparison.md](README.lmstudio-comparison.md).
 
 ### Mixed Traffic
 
@@ -114,6 +165,40 @@ LM Studio:
 - concurrent short request: about `2.08x`
 - total mixed makespan: about `1.91x`
 
+On the current Phase 3 managed `mixed_traffic` run, the control plane still
+keeps the short request off the warm long slot:
+
+- configured `ctx_size=65536`, runtime-reported per-slot context: `32768`
+- warm long request: `13.123s`
+- repeated long request: `0.548s`
+- concurrent short request: `0.666s`
+- total mixed makespan: `0.668s`
+- repeat speedup: `23.95x`
+
+This is why the concurrency benchmark now keys off the runtime's effective
+per-slot context instead of assuming the configured `ctx_size` is available to
+every slot.
+
+### Multi-Model Pool
+
+The new model-pool layer keeps the primary long-context chat warm by giving
+each registered GGUF model its own managed `llama-server` process and policy
+state instead of swapping one global runtime in place.
+
+On the current DGX Spark Phase 2 validation run:
+
+- primary `Q4_K_M` long prompt: `12018` estimated prompt tokens
+- primary cold long turn: `9.336s`
+- primary warm follow-up before secondary activity: `0.402s`
+- secondary `Q4_K_S` manual load: `2.016s`
+- secondary short request: `0.242s`
+- secondary manual unload: `0.009s`
+- primary warm follow-up after secondary load/unload: `0.279s`
+- admin diagnostics after the run:
+  - primary stayed `loaded=true`, `pinned=true`
+  - secondary ended `loaded=false`, `last_unload_reason=manual_unload`
+  - continuation state reported `last_decision.reason=hit`
+
 ### What Improved
 
 The recent `llama.cpp` work did not replace llama.cpp's cache engine. Instead,
@@ -121,8 +206,9 @@ it added oMLX-style scheduling on top:
 
 - conversation stickiness for long prompts
 - explicit slot assignment for warm follow-up requests
+- managed slot save/restore after short runtime restarts
 - stale idle-slot recycling for unrelated short requests
-- benchmark and admin diagnostics for slot routing decisions
+- benchmark and admin diagnostics for slot routing and restore decisions
 
 That means the current advantage is strongest when your workload includes long
 conversations plus unrelated short requests or multiple chats at once.
@@ -153,6 +239,31 @@ omlx-dgx serve \
   --serving-preset single_session_low_latency
 ```
 
+Additional GGUF models are registered from the admin API for now. Example:
+
+```bash
+curl -X POST http://127.0.0.1:8008/admin/api/runtime/model-pool \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model_id": "secondary",
+    "model_alias": "qwen35-secondary",
+    "artifact_path": "/models/Qwen3.5-4B-Q4_K_S.gguf",
+    "base_url": "http://127.0.0.1:30001",
+    "gguf_variant": "Q4_K_S",
+    "ctx_size": 16384,
+    "parallel_slots": 1,
+    "ttl_seconds": 900,
+    "idle_unload_seconds": 120
+  }'
+```
+
+Then use:
+
+- `POST /admin/api/runtime/model-pool/load`
+- `POST /admin/api/runtime/model-pool/unload`
+- `POST /admin/api/runtime/model-pool/pin`
+- `GET /admin/api/runtime/model-pool`
+
 ## Telemetry
 
 `/admin/api/runtime` now preserves the low-level GPU telemetry state instead of
@@ -162,6 +273,12 @@ you will see it under:
 - `backend.details.telemetry.gpu_metrics_ok`
 - `backend.details.telemetry.gpu_metrics_error`
 - `backend.details.telemetry.system_memory_kb`
+
+Phase 3 also adds session-restore diagnostics under:
+
+- `backend.details.session_restore.last_save`
+- `backend.details.session_restore.last_restore`
+- `backend.details.session_restore.snapshots`
 
 This makes it possible to distinguish "no GPU info because nothing is wrong"
 from "no GPU info because NVML is currently broken".
@@ -176,21 +293,51 @@ python3 scripts/bench_qwen35_4b_matrix.py \
   --omlx-variant q4ks-16k,http://127.0.0.1:8020,http://127.0.0.1:31200 \
   --omlx-variant q4km-32k,http://127.0.0.1:8021,http://127.0.0.1:31201 \
   --omlx-variant q6k-32k,http://127.0.0.1:8022,http://127.0.0.1:31202 \
-  --lmstudio-variant lmstudio,http://127.0.0.1:1234,qwen3.5-4b \
+  --lmstudio-variant lmstudio,http://127.0.0.1:1234,qwen3.5-4b@q4_k_m \
+  --target-context-tokens 65536 \
   --include-concurrency
 ```
 
 The output now includes:
 
 - `serving_preset`
+- effective benchmark context fields
 - telemetry health/error fields
 - single-session follow-up latency
+- managed restart recovery replay latency
 - mixed-traffic makespan
 - automatic recommendations for:
   - best single-session follow-up
   - best mixed-traffic profile
   - best long-output throughput
   - best cold long-prefix latency
+
+## Codex CLI Phase Execution
+
+The DGX roadmap is also split into phase task books for `Codex CLI`.
+
+- roadmap index: `plans/codex-roadmap.md`
+- phase docs: `plans/codex-phase-1.md` through `plans/codex-phase-5.md`
+- repo-local skill source: `codex_skills/omlx-dgx-phase-executor/`
+- launcher: `scripts/run_codex_phase.sh`
+
+Run one phase at a time:
+
+```bash
+bash scripts/run_codex_phase.sh 1
+```
+
+Do not feed all five phases into a single Codex run.
+
+For a real five-step sequential run, use:
+
+```bash
+bash scripts/run_codex_all_phases.sh
+```
+
+This runner executes Phase 1 through Phase 5 in order, saves each result under
+`.runtime/codex-phase-runs/`, and stops immediately if any phase does not end
+with `Phase Status: PASS`.
 
 ## Package Layout
 

@@ -56,31 +56,65 @@ researching a DGX-oriented runtime around SGLang/HiCache, TensorRT-LLM, and
 `llama.cpp` GGUF serving. The most mature DGX result in the repo today is
 `Qwen3.5-4B Q4_K_M` on `llama.cpp`, where the control plane adds oMLX-style
 session stickiness so short concurrent requests do not blow away a long
-conversation's warm prefix. The current DGX Spark defaults are split into two
-named presets:
+conversation's warm prefix. The DGX path now also has a managed GGUF
+model-pool layer for multi-model registration, pin, TTL, idle unload, LRU
+eviction, and manual load/unload from `/admin/api/runtime/model-pool`. Phase 3
+also adds managed slot save/restore plus persisted session restore metadata in
+`/admin/api/runtime`. Phase 4 adds capability-aware `/v1/messages` handling,
+explicit unsupported-capability responses for `/v1/embeddings` and
+`/v1/rerank` on chat-only DGX backends, and stable benchmark report retrieval
+under `/admin/api/benchmarks`. The current DGX Spark defaults are split into
+two named presets:
 
 - `single_session_low_latency` for one local long-running chat (`parallel_slots=1`, `ctx_size=32768`)
 - `mixed_traffic` for long-context + short-request concurrency (`parallel_slots=2`, `ctx_size=32768`)
 
+For explicit deep-context evaluation, the benchmark path now also supports a
+managed `ctx_size=65536` service while keeping the `32768` presets above as the
+day-to-day default.
+
 Current measured mixed-traffic result on DGX Spark:
 
-- `omlx_dgx + llama.cpp`: repeated long request `0.097s`, concurrent short request `0.176s`, total mixed makespan `0.192s`
-- `LM Studio`: repeated long request `0.131s`, concurrent short request `0.366s`, total mixed makespan `0.367s`
+- `omlx_dgx + llama.cpp`: warm long request `13.123s`, repeated long request `0.548s`, concurrent short request `0.666s`, total mixed makespan `0.668s`
+- `mixed_traffic` note: with `parallel_slots=2`, the runtime reported `32768` effective context per slot even when `ctx_size=65536` was configured
 
-Current measured single-session follow-up result on DGX Spark:
+Current measured single-session result on the explicit `65536` benchmark path:
 
-- `Q4_K_M`: `0.111s` average follow-up latency
-- `Q4_K_S`: `0.115s` average follow-up latency
-- `Q6_K`: `0.135s` average follow-up latency
+- `Q4_K_M`: `56200` prompt tokens on the cold long-prefix turn
+- `Q4_K_M`: `40.334s` cold long prefill, `1.134s` repeated long-prefix turn
+- `Q4_K_M`: `0.307s` warm follow-up before restart
+- `Q4_K_M`: `3.285s` post-restart restored follow-up, with `7.101ms` slot restore RPC time
+- `Q4_K_M`: `0.185s` on the next warm follow-up after restore
+- `Q4_K_M`: `12.03x` faster restored follow-up versus the cold long prefill
 
-Against `LM Studio` on the same `Q4_K_M` and `32k` context, the current
-single-session follow-up path in `omlx_dgx + llama.cpp` is faster:
+Against the currently loaded `LM Studio` `Q4_K_M` baseline (`32768`
+loaded_context_length), the current single-session follow-up path in
+`omlx_dgx + llama.cpp` is still faster:
 
-- `omlx_dgx + llama.cpp`: `0.111s` average follow-up latency
-- `LM Studio`: `0.238s` average follow-up latency
+- `omlx_dgx + llama.cpp`: `0.134s` average follow-up latency
+- `LM Studio`: `0.262s` average follow-up latency
+
+Current measured Phase 2 model-pool validation on DGX Spark:
+
+- primary `Q4_K_M` cold long turn: `9.336s` at `12018` estimated prompt tokens
+- primary warm follow-up before secondary activity: `0.402s`
+- secondary `Q4_K_S` manual load/request/unload: `2.016s` / `0.242s` / `0.009s`
+- primary warm follow-up after secondary load/unload: `0.279s`
+- admin diagnostics: primary stayed `loaded=true, pinned=true`; secondary ended `loaded=false, last_unload_reason=manual_unload`
 
 See [README.dgx.md](README.dgx.md) for the current scope, launcher, and the
 latest benchmark notes.
+
+For the latest apples-to-apples DGX vs `LM Studio` benchmark comparison on the
+same `Qwen3.5-4B Q4_K_M` GGUF artifact, see
+[README.lmstudio-comparison.md](README.lmstudio-comparison.md).
+
+For phase-by-phase Codex execution on the DGX path, see:
+
+- `plans/codex-roadmap.md`
+- `plans/codex-phase-1.md` through `plans/codex-phase-5.md`
+- `scripts/run_codex_phase.sh`
+- `scripts/run_codex_all_phases.sh`
 
 ### macOS App
 

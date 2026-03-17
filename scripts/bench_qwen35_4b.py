@@ -16,14 +16,29 @@ from typing import Any, Dict
 
 def _http_json(url: str, *, method: str = "GET", payload: Dict[str, Any] | None = None) -> Dict[str, Any]:
     data = None if payload is None else json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers={"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=180) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error = None
+    for attempt in range(4):
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {502, 503, 504} or attempt == 3:
+                raise
+            last_error = exc
+        except urllib.error.URLError as exc:
+            if attempt == 3:
+                raise
+            last_error = exc
+        time.sleep(1.0 + attempt)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"request failed without response: {url}")
 
 
 def _http_text(url: str) -> str:
@@ -52,6 +67,24 @@ def _extract_metric(metrics_text: str, metric_name: str) -> float | None:
     if not match:
         return None
     return float(match.group(1))
+
+
+def _estimate_prompt_tokens(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, len(text) // 4, len(text.split()))
+
+
+def _build_long_prefix(prefix_unit: str, target_tokens: int) -> tuple[str, int, int]:
+    unit = prefix_unit.strip()
+    repeat = 1
+    prefix = unit
+    estimated_tokens = _estimate_prompt_tokens(prefix)
+    while estimated_tokens < target_tokens:
+        repeat += 1
+        prefix = " ".join([unit] * repeat)
+        estimated_tokens = _estimate_prompt_tokens(prefix)
+    return prefix, repeat, estimated_tokens
 
 
 def _runtime_memory_usage(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -195,6 +228,7 @@ def _runtime_summary(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
         "routing_profiles": routing.get("profiles"),
         "last_route": routing.get("last_decision"),
         "continuation": details.get("continuation"),
+        "session_restore": details.get("session_restore"),
     }
 
 
@@ -279,6 +313,12 @@ def _run_case(
             .get("continuation", {})
             .get("last_decision")
         )
+        session_restore_after = (
+            after["runtime"]
+            .get("backend", {})
+            .get("details", {})
+            .get("session_restore", {})
+        )
         return {
             "wall_time_sec": round(wall_time, 3),
             "ttft_sec": None,
@@ -311,6 +351,7 @@ def _run_case(
                 .get("last_decision")
             ),
             "continuation_after": continuation_after,
+            "session_restore_after": session_restore_after,
             "continuation_hit": (
                 None if continuation_after is None else continuation_after.get("continuation_hit")
             ),
@@ -347,6 +388,12 @@ def _run_case(
         .get("details", {})
         .get("continuation", {})
         .get("last_decision")
+    )
+    session_restore_after = (
+        after["runtime"]
+        .get("backend", {})
+        .get("details", {})
+        .get("session_restore", {})
     )
 
     return {
@@ -387,6 +434,7 @@ def _run_case(
             .get("last_decision")
         ),
         "continuation_after": continuation_after,
+        "session_restore_after": session_restore_after,
         "continuation_hit": (
             None if continuation_after is None else continuation_after.get("continuation_hit")
         ),
@@ -442,6 +490,12 @@ def _run_messages_case(
         .get("continuation", {})
         .get("last_decision")
     )
+    session_restore_after = (
+        after["runtime"]
+        .get("backend", {})
+        .get("details", {})
+        .get("session_restore", {})
+    )
     return {
         "wall_time_sec": round(wall_time, 3),
         "token_per_second": (
@@ -473,6 +527,7 @@ def _run_messages_case(
             .get("last_decision")
         ),
         "continuation_after": continuation_after,
+        "session_restore_after": session_restore_after,
         "continuation_hit": (
             None if continuation_after is None else continuation_after.get("continuation_hit")
         ),
@@ -562,13 +617,181 @@ def _run_single_session_followup(
     }
 
 
+def _restart_managed_runtime(control_plane_url: str) -> Dict[str, Any]:
+    stop_result = _http_json(
+        f"{control_plane_url}/admin/api/runtime/stop",
+        method="POST",
+        payload={},
+    )
+    start_result = _http_json(
+        f"{control_plane_url}/admin/api/runtime/start",
+        method="POST",
+        payload={},
+    )
+    return {
+        "stop": stop_result,
+        "start": start_result,
+    }
+
+
+def _run_single_session_recovery(
+    *,
+    control_plane_url: str,
+    runtime_url: str,
+    model: str,
+    long_prompt: str,
+    disable_thinking: bool,
+    llama_cpp_reasoning_compat: bool,
+    conversation_id: str,
+    runtime_summary: Dict[str, Any],
+    initial_runtime: Dict[str, Any],
+) -> Dict[str, Any]:
+    if runtime_summary.get("backend_format") != "llama_cpp_gguf":
+        return {"skipped": True, "reason": "backend_not_llama_cpp"}
+    diagnostics = (
+        initial_runtime.get("backend", {})
+        .get("details", {})
+        .get("diagnostics", {})
+    )
+    if not diagnostics.get("managed_process_running"):
+        return {"skipped": True, "reason": "runtime_not_managed_by_control_plane"}
+    if not runtime_summary.get("single_session_continuation_enabled"):
+        return {"skipped": True, "reason": "single_session_continuation_disabled"}
+
+    turn1_messages = [
+        {
+            "role": "user",
+            "content": (
+                f"{long_prompt}\n\n"
+                "Explain in one short sentence why reusing context matters."
+            ),
+        }
+    ]
+    turn1 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn1_messages,
+        max_tokens=24,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+    turn2_messages = turn1_messages + [
+        turn1["assistant"],
+        {"role": "user", "content": "Now answer with exactly one word: benefit?"},
+    ]
+    turn2 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn2_messages,
+        max_tokens=8,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+
+    restart = _restart_managed_runtime(control_plane_url)
+
+    turn3_messages = turn2_messages + [
+        turn2["assistant"],
+        {
+            "role": "user",
+            "content": "After the short runtime restart, answer with one different word.",
+        },
+    ]
+    turn3 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn3_messages,
+        max_tokens=8,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+    turn4_messages = turn3_messages + [
+        turn3["assistant"],
+        {"role": "user", "content": "Again, one different word only."},
+    ]
+    turn4 = _run_messages_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        messages=turn4_messages,
+        max_tokens=8,
+        disable_thinking=disable_thinking,
+        llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+        conversation_id=conversation_id,
+    )
+    turn3_restore = turn3.get("session_restore_after") or {}
+    turn3_last_restore = (
+        turn3_restore.get("last_restore")
+        if isinstance(turn3_restore, dict)
+        else None
+    )
+    cold_to_restored_speedup = None
+    if turn1.get("wall_time_sec") and turn3.get("wall_time_sec"):
+        cold_to_restored_speedup = round(
+            turn1["wall_time_sec"] / max(turn3["wall_time_sec"], 1e-6),
+            2,
+        )
+    return {
+        "restart": restart,
+        "turn1_long": turn1,
+        "turn2_warm_followup": turn2,
+        "turn3_post_restart_followup": turn3,
+        "turn4_post_restore_followup": turn4,
+        "summary": {
+            "turn1_cold_long_sec": turn1.get("wall_time_sec"),
+            "turn2_warm_followup_sec": turn2.get("wall_time_sec"),
+            "turn3_post_restart_followup_sec": turn3.get("wall_time_sec"),
+            "turn4_post_restore_followup_sec": turn4.get("wall_time_sec"),
+            "turn3_recovery_replay_sec": turn3.get("wall_time_sec"),
+            "turn4_post_recovery_followup_sec": turn4.get("wall_time_sec"),
+            "turn2_continuation_hit": turn2.get("continuation_hit"),
+            "turn3_continuation_hit": turn3.get("continuation_hit"),
+            "turn4_continuation_hit": turn4.get("continuation_hit"),
+            "turn3_restore_ok": (
+                None
+                if not isinstance(turn3_last_restore, dict)
+                else turn3_last_restore.get("ok")
+            ),
+            "turn3_restore_status": (
+                None
+                if not isinstance(turn3_last_restore, dict)
+                else turn3_last_restore.get("status")
+            ),
+            "turn3_restore_ms": (
+                None
+                if not isinstance(turn3_last_restore, dict)
+                else turn3_last_restore.get("restore_ms")
+            ),
+            "turn3_restore_n_restored": (
+                None
+                if not isinstance(turn3_last_restore, dict)
+                else turn3_last_restore.get("n_restored")
+            ),
+            "turn3_recovery_reason": (
+                (turn3.get("continuation_after") or {}).get("reason")
+            ),
+            "turn4_post_recovery_reason": (
+                (turn4.get("continuation_after") or {}).get("reason")
+            ),
+            "cold_to_restored_speedup_x": cold_to_restored_speedup,
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark Qwen3.5-4B on the local control plane")
     parser.add_argument("--control-plane-url", default="http://127.0.0.1:8010")
     parser.add_argument("--runtime-url", default="http://127.0.0.1:31000")
     parser.add_argument("--model", default="qwen35-4b")
-    parser.add_argument("--long-prefix-repeat", type=int, default=512)
+    parser.add_argument("--long-prefix-repeat", type=int, default=0)
     parser.add_argument("--long-output-max-tokens", type=int, default=192)
+    parser.add_argument("--target-context-tokens", type=int, default=65536)
     parser.add_argument("--prefix-salt", default="")
     parser.add_argument("--disable-thinking", action="store_true", default=True)
     args = parser.parse_args()
@@ -577,8 +800,6 @@ def main() -> None:
     prefix_unit = "DGX Spark Qwen3.5 cache benchmark"
     if args.prefix_salt:
         prefix_unit = f"{prefix_unit} {args.prefix_salt}"
-    long_prefix = " ".join([prefix_unit] * args.long_prefix_repeat)
-    long_prompt = f"{long_prefix}\n\nReply with exactly OK."
     long_output_prompt = (
         "Write a numbered list from 1 to 64. "
         "Each line must be short and in the format '<n>. cache benchmark'."
@@ -610,10 +831,46 @@ def main() -> None:
     initial_runtime = _http_json(f"{args.control_plane_url}/admin/api/runtime")
     runtime_summary = _runtime_summary(initial_runtime)
     llama_cpp_reasoning_compat = runtime_summary.get("backend_format") == "llama_cpp_gguf"
+    loaded_context_length = runtime_summary.get("loaded_context_length")
+    if isinstance(loaded_context_length, int) and loaded_context_length > 0:
+        effective_context_tokens = min(args.target_context_tokens, loaded_context_length)
+    else:
+        effective_context_tokens = args.target_context_tokens
+    if args.long_prefix_repeat > 0:
+        long_prefix = " ".join([prefix_unit] * args.long_prefix_repeat)
+        long_prefix_repeat = args.long_prefix_repeat
+        long_prefix_estimated_tokens = _estimate_prompt_tokens(long_prefix)
+    else:
+        context_headroom = max(
+            4096,
+            min(16384, effective_context_tokens // 4),
+        )
+        long_prefix_budget = max(
+            1024,
+            effective_context_tokens - context_headroom,
+        )
+        long_prefix, long_prefix_repeat, long_prefix_estimated_tokens = _build_long_prefix(
+            prefix_unit,
+            long_prefix_budget,
+        )
+    long_prompt = f"{long_prefix}\n\nReply with exactly OK."
+    long_prompt_estimated_tokens = _estimate_prompt_tokens(long_prompt)
 
     results = {
+        "urls": {
+            "control_plane_url": args.control_plane_url,
+            "runtime_url": args.runtime_url,
+        },
         "health": health,
         "runtime_summary": runtime_summary,
+        "benchmark_context": {
+            "requested_context_tokens": args.target_context_tokens,
+            "effective_context_tokens": effective_context_tokens,
+            "loaded_context_length": loaded_context_length,
+            "long_prefix_repeat": long_prefix_repeat,
+            "long_prefix_estimated_tokens": long_prefix_estimated_tokens,
+            "long_prompt_estimated_tokens": long_prompt_estimated_tokens,
+        },
         "short_chat": _run_case(
             control_plane_url=args.control_plane_url,
             runtime_url=args.runtime_url,
@@ -672,6 +929,17 @@ def main() -> None:
             disable_thinking=args.disable_thinking,
             llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-single-session-followup",
+        ),
+        "single_session_recovery": _run_single_session_recovery(
+            control_plane_url=args.control_plane_url,
+            runtime_url=args.runtime_url,
+            model=args.model,
+            long_prompt=long_prefix,
+            disable_thinking=args.disable_thinking,
+            llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
+            conversation_id="bench-single-session-recovery",
+            runtime_summary=runtime_summary,
+            initial_runtime=initial_runtime,
         ),
     }
 

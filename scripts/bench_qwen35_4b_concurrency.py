@@ -118,8 +118,9 @@ def main() -> None:
     parser.add_argument("--control-plane-url", default="http://127.0.0.1:8020")
     parser.add_argument("--runtime-url", default="http://127.0.0.1:31200")
     parser.add_argument("--model", default="qwen35-4b-gguf")
-    parser.add_argument("--long-prefix-repeat", type=int, default=300)
+    parser.add_argument("--long-prefix-repeat", type=int, default=0)
     parser.add_argument("--long-output-max-tokens", type=int, default=192)
+    parser.add_argument("--target-context-tokens", type=int, default=65536)
     parser.add_argument("--prefix-salt", default="")
     args = parser.parse_args()
 
@@ -132,12 +133,49 @@ def main() -> None:
         f"{args.control_plane_url}/admin/api/runtime"
     )
     runtime_summary = single_bench._runtime_summary(runtime_before)  # type: ignore[attr-defined]
+    loaded_context_length = runtime_summary.get("loaded_context_length")
+    if isinstance(loaded_context_length, int) and loaded_context_length > 0:
+        effective_context_tokens = min(args.target_context_tokens, loaded_context_length)
+    else:
+        effective_context_tokens = args.target_context_tokens
 
     prefix_base = "Concurrent llama.cpp Qwen3.5 cache benchmark"
     if args.prefix_salt:
         prefix_base = f"{prefix_base} {args.prefix_salt}"
-    long_prefix_a = _long_prefix_prompt(f"{prefix_base} session-a", args.long_prefix_repeat)
-    long_prefix_b = _long_prefix_prompt(f"{prefix_base} session-b", args.long_prefix_repeat)
+    if args.long_prefix_repeat > 0:
+        long_prefix_a = _long_prefix_prompt(
+            f"{prefix_base} session-a",
+            args.long_prefix_repeat,
+        )
+        long_prefix_b = _long_prefix_prompt(
+            f"{prefix_base} session-b",
+            args.long_prefix_repeat,
+        )
+        long_prefix_repeat = args.long_prefix_repeat
+        long_prefix_estimated_tokens = single_bench._estimate_prompt_tokens(  # type: ignore[attr-defined]
+            long_prefix_a
+        )
+    else:
+        context_headroom = max(
+            4096,
+            min(16384, effective_context_tokens // 4),
+        )
+        long_prefix_budget = max(
+            1024,
+            effective_context_tokens - context_headroom,
+        )
+        long_prefix_a_raw, long_prefix_repeat, long_prefix_estimated_tokens = (
+            single_bench._build_long_prefix(  # type: ignore[attr-defined]
+                f"{prefix_base} session-a",
+                long_prefix_budget,
+            )
+        )
+        long_prefix_b_raw, _, _ = single_bench._build_long_prefix(  # type: ignore[attr-defined]
+            f"{prefix_base} session-b",
+            long_prefix_budget,
+        )
+        long_prefix_a = f"{long_prefix_a_raw}\n\nReply with exactly OK."
+        long_prefix_b = f"{long_prefix_b_raw}\n\nReply with exactly OK."
     long_output_prompt = (
         "Write a numbered list from 1 to 64. "
         "Each line must be short and in the format '<n>. cache benchmark'."
@@ -250,8 +288,19 @@ def main() -> None:
         f"{args.control_plane_url}/admin/api/runtime"
     )
     results = {
+        "urls": {
+            "control_plane_url": args.control_plane_url,
+            "runtime_url": args.runtime_url,
+        },
         "health": health,
         "runtime_summary": runtime_summary,
+        "benchmark_context": {
+            "requested_context_tokens": args.target_context_tokens,
+            "effective_context_tokens": effective_context_tokens,
+            "loaded_context_length": loaded_context_length,
+            "long_prefix_repeat": long_prefix_repeat,
+            "long_prefix_estimated_tokens": long_prefix_estimated_tokens,
+        },
         "runtime_after": {
             "slot_router": (
                 runtime_after.get("backend", {})

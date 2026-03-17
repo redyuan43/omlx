@@ -15,14 +15,31 @@ import threading
 import time
 from collections import OrderedDict, deque
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 from urllib.parse import urlparse
 
-from omlx_dgx.config import BackendConfig
+from omlx_dgx.config import (
+    BackendConfig,
+    DGXRuntimeConfig,
+    LlamaCppModelRegistration,
+    apply_llama_cpp_serving_preset,
+)
+from omlx_dgx.model_capabilities import infer_multimodal_capabilities
+from omlx_dgx.session_restore import (
+    SessionRestoreSnapshot,
+    SessionRestoreStore,
+    snapshot_key,
+)
 
-from .backend import BackendError, HttpOpenAIBackendAdapter, RuntimeMetrics
+from .backend import (
+    BackendAdapter,
+    BackendCapabilities,
+    BackendError,
+    HttpOpenAIBackendAdapter,
+    RuntimeMetrics,
+)
 
 
 def _stringify_command(args: List[str]) -> str:
@@ -31,6 +48,8 @@ def _stringify_command(args: List[str]) -> str:
 
 _RECYCLE_OWNED_IDLE_SLOT_MIN_AGE_SECONDS = 1.0
 _SINGLE_SLOT_CONTINUATION_TTL_SECONDS = 600.0
+_PERSISTED_RUNTIME_STATE_VERSION = 1
+_SESSION_RESTORE_RECENT_LIMIT = 16
 
 
 def _coerce_response_payload(response) -> Dict[str, Any]:
@@ -259,6 +278,8 @@ class LlamaCppDiagnostics:
     slot_prompt_similarity: float
     enable_runtime_metrics: bool
     enable_session_stickiness: bool
+    enable_session_restore: bool
+    session_restore_min_prompt_tokens: int
     sticky_session_prompt_threshold: int
     sticky_max_sessions: int
     split_mode: str
@@ -272,6 +293,9 @@ class LlamaCppDiagnostics:
     startup_timeout_seconds: int
     single_session_continuation_enabled: bool
     single_session_continuation_ttl_seconds: int
+    slot_save_path: str
+    supports_vision: bool
+    supports_ocr: bool
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -445,6 +469,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self.config = config
         self.state_dir = Path(state_dir)
         self.process_manager = LlamaCppProcessManager(self.state_dir / "runtime")
+        self._slot_save_path = self.state_dir / "runtime" / "slot_saves"
+        self._slot_save_path.mkdir(parents=True, exist_ok=True)
+        self._session_restore_store = SessionRestoreStore(
+            self.state_dir / "runtime" / "session_restore"
+        )
         parsed = urlparse(config.base_url)
         self.launch_host = parsed.hostname or "127.0.0.1"
         self.launch_port = parsed.port or 30000
@@ -454,13 +483,28 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._recent_slot_decisions: Deque[SlotRouteDecision] = deque(maxlen=32)
         self._last_slot_decision: Optional[SlotRouteDecision] = None
         self._single_slot_continuation: Optional[ContinuationState] = None
+        self._single_slot_recovery_pending = False
+        self._single_slot_restored_from_disk = False
         self._recent_continuation_decisions: Deque[ContinuationDecision] = deque(maxlen=32)
         self._last_continuation_decision: Optional[ContinuationDecision] = None
+        self._runtime_state_signature = ""
+        self._runtime_state_path = self.state_dir / "llama_cpp_runtime_state.json"
+        self._last_slot_save: Optional[Dict[str, Any]] = None
+        self._last_slot_restore: Optional[Dict[str, Any]] = None
+        self._session_restore_counts: Dict[str, int] = {
+            "saved": 0,
+            "restored": 0,
+            "restore_miss": 0,
+            "save_error": 0,
+            "restore_error": 0,
+            "restore_fallback": 0,
+        }
         self._continuation_counts: Dict[str, int] = {
             "disabled": 0,
             "no_conversation_id": 0,
             "cold_start": 0,
             "hit": 0,
+            "recovery_replay": 0,
             "prefix_drift": 0,
             "shape_changed": 0,
             "model_changed": 0,
@@ -472,6 +516,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "explicit_slot": 0,
             "sticky_existing": 0,
             "sticky_new_long_prompt": 0,
+            "sticky_restored": 0,
             "sticky_no_idle_slot": 0,
             "short_prompt": 0,
             "short_prompt_unowned_slot": 0,
@@ -481,6 +526,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "unkeyed_recycled_slot": 0,
             "single_slot_cold_start": 0,
             "single_slot_hit": 0,
+            "single_slot_recovery_replay": 0,
             "single_slot_prefix_drift": 0,
             "single_slot_shape_changed": 0,
             "single_slot_model_changed": 0,
@@ -488,6 +534,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "single_slot_slot_reset": 0,
             "single_slot_no_conversation_id": 0,
         }
+        self._load_runtime_state()
 
     @classmethod
     def from_backend_config(
@@ -557,6 +604,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             args.extend(["--cache-reuse", str(self.config.cache_reuse)])
         if self.config.enable_runtime_metrics:
             args.append("--metrics")
+        if self.config.enable_session_restore:
+            args.extend(["--slot-save-path", str(self._slot_save_path)])
         if self.config.no_context_shift:
             args.append("--no-context-shift")
         if self.config.jinja:
@@ -606,6 +655,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             slot_prompt_similarity=self.config.slot_prompt_similarity,
             enable_runtime_metrics=self.config.enable_runtime_metrics,
             enable_session_stickiness=self.config.enable_session_stickiness,
+            enable_session_restore=self.config.enable_session_restore,
+            session_restore_min_prompt_tokens=self._session_restore_threshold(),
             sticky_session_prompt_threshold=self.config.sticky_session_prompt_threshold,
             sticky_max_sessions=self.config.sticky_max_sessions,
             split_mode=self.config.split_mode,
@@ -623,6 +674,16 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             single_session_continuation_ttl_seconds=int(
                 _SINGLE_SLOT_CONTINUATION_TTL_SECONDS
             ),
+            slot_save_path=str(self._slot_save_path),
+            supports_vision=gguf_variant.startswith("VL")
+            or infer_multimodal_capabilities(
+                self.config.artifact_path,
+                self.config.model_repo_id,
+            ).vision_chat,
+            supports_ocr=infer_multimodal_capabilities(
+                self.config.artifact_path,
+                self.config.model_repo_id,
+            ).ocr,
         )
 
     def _extract_slots_list(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -653,6 +714,429 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             )
         return summary
 
+    def _current_runtime_signature(self) -> str:
+        pid = self.process_manager.pid()
+        if pid is not None:
+            return f"managed-pid:{pid}"
+        return ""
+
+    def _serialize_prompt_value(
+        self, value: str | tuple[str, ...]
+    ) -> str | List[str]:
+        if isinstance(value, tuple):
+            return list(value)
+        return value
+
+    def _deserialize_prompt_value(
+        self,
+        *,
+        prompt_mode: str,
+        value: Any,
+    ) -> str | tuple[str, ...]:
+        if prompt_mode == "messages":
+            if isinstance(value, list):
+                return tuple(str(item) for item in value)
+            if isinstance(value, tuple):
+                return tuple(str(item) for item in value)
+            if isinstance(value, str) and value:
+                return (value,)
+            return ()
+        if value is None:
+            return ""
+        return str(value)
+
+    def _serialize_continuation_state(
+        self,
+        state: ContinuationState,
+    ) -> Dict[str, Any]:
+        payload = asdict(state)
+        payload["prompt_value"] = self._serialize_prompt_value(state.prompt_value)
+        payload["slot_prompt_value"] = self._serialize_prompt_value(
+            state.slot_prompt_value
+        )
+        return payload
+
+    def _deserialize_continuation_state(
+        self,
+        payload: Dict[str, Any],
+    ) -> Optional[ContinuationState]:
+        try:
+            prompt_mode = str(payload.get("prompt_mode", "prompt"))
+            return ContinuationState(
+                conversation_id=str(payload["conversation_id"]),
+                slot_id=int(payload.get("slot_id", 0)),
+                model_id=str(payload.get("model_id", "")),
+                estimated_prompt_tokens=int(payload.get("estimated_prompt_tokens", 0)),
+                last_used_at=float(payload.get("last_used_at", 0.0)),
+                prefix_digest=str(payload.get("prefix_digest", "")),
+                request_shape_digest=str(payload.get("request_shape_digest", "")),
+                prompt_mode=prompt_mode,
+                prompt_value=self._deserialize_prompt_value(
+                    prompt_mode=prompt_mode,
+                    value=payload.get("prompt_value"),
+                ),
+                message_count=int(payload.get("message_count", 0)),
+                slot_prompt_value=self._deserialize_prompt_value(
+                    prompt_mode=prompt_mode,
+                    value=payload.get("slot_prompt_value"),
+                ),
+                slot_message_count=int(payload.get("slot_message_count", 0)),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _session_restore_enabled(self) -> bool:
+        return bool(
+            self.config.enable_session_restore
+            and self.config.enable_session_stickiness
+        )
+
+    def _session_restore_threshold(self) -> int:
+        threshold = (
+            self.config.session_restore_min_prompt_tokens
+            or self.config.sticky_session_prompt_threshold
+            or 1
+        )
+        return max(1, int(threshold))
+
+    def _session_restore_filename(
+        self,
+        *,
+        conversation_id: str,
+        model_id: str,
+        slot_id: int,
+    ) -> str:
+        return f"{snapshot_key(model_id, conversation_id)}-slot{slot_id}.bin"
+
+    def _slot_action(
+        self,
+        *,
+        slot_id: int,
+        action: str,
+        payload: Dict[str, Any],
+        timeout: float = 180.0,
+    ) -> Dict[str, Any]:
+        response = self._request(
+            "POST",
+            f"slots/{slot_id}?action={action}",
+            timeout=timeout,
+            json=payload,
+        )
+        if not response.ok:
+            raise BackendError(
+                f"llama.cpp slot {action} failed for slot {slot_id}: "
+                f"{response.status_code} {response.text.strip()}"
+            )
+        result = _coerce_response_payload(response)
+        if not isinstance(result, dict):
+            raise BackendError(
+                f"llama.cpp slot {action} returned a non-json payload"
+            )
+        return result
+
+    def _should_persist_session_snapshot(
+        self,
+        *,
+        conversation_id: str,
+        model_id: str,
+        estimated_prompt_tokens: int,
+    ) -> bool:
+        if not self._session_restore_enabled():
+            return False
+        if self.config.parallel_slots <= 1:
+            return True
+        if estimated_prompt_tokens >= self._session_restore_threshold():
+            return True
+        existing = self._session_restore_store.get(
+            conversation_id=conversation_id,
+            model_id=model_id,
+            touch=False,
+        )
+        return existing is not None
+
+    def _persist_session_snapshot(
+        self,
+        state: ContinuationState,
+    ) -> None:
+        if not self._should_persist_session_snapshot(
+            conversation_id=state.conversation_id,
+            model_id=state.model_id,
+            estimated_prompt_tokens=state.estimated_prompt_tokens,
+        ):
+            return
+
+        existing = self._session_restore_store.get(
+            conversation_id=state.conversation_id,
+            model_id=state.model_id,
+            touch=False,
+        )
+        filename = (
+            existing.save_filename
+            if existing is not None and existing.save_filename
+            else self._session_restore_filename(
+                conversation_id=state.conversation_id,
+                model_id=state.model_id,
+                slot_id=state.slot_id,
+            )
+        )
+        try:
+            result = self._slot_action(
+                slot_id=state.slot_id,
+                action="save",
+                payload={"filename": filename},
+            )
+        except Exception as exc:
+            with self._lock:
+                self._session_restore_counts["save_error"] = (
+                    self._session_restore_counts.get("save_error", 0) + 1
+                )
+                self._last_slot_save = {
+                    "ok": False,
+                    "conversation_key_hash": _hash_key(state.conversation_id),
+                    "slot_id": state.slot_id,
+                    "filename": filename,
+                    "error": str(exc),
+                    "timestamp": round(time.time(), 3),
+                }
+            return
+
+        timings = result.get("timings", {})
+        snapshot = SessionRestoreSnapshot(
+            conversation_id=state.conversation_id,
+            model_id=state.model_id,
+            slot_id=state.slot_id,
+            estimated_prompt_tokens=state.estimated_prompt_tokens,
+            prefix_digest=state.prefix_digest,
+            request_shape_digest=state.request_shape_digest,
+            prompt_mode=state.prompt_mode,
+            message_count=state.message_count,
+            slot_message_count=state.slot_message_count,
+            save_filename=filename,
+            state_payload=self._serialize_continuation_state(state),
+            saved_at=time.time(),
+            last_access_at=time.time(),
+            save_ms=timings.get("save_ms"),
+            n_saved=int(result.get("n_saved", 0) or 0),
+            n_written=int(result.get("n_written", 0) or 0),
+            restore_count=0 if existing is None else existing.restore_count,
+            last_restore_at=None if existing is None else existing.last_restore_at,
+            last_restore_ms=None if existing is None else existing.last_restore_ms,
+            last_restore_n_restored=(
+                0 if existing is None else existing.last_restore_n_restored
+            ),
+            last_restore_n_read=0 if existing is None else existing.last_restore_n_read,
+            last_restore_status="" if existing is None else existing.last_restore_status,
+            last_restore_error="" if existing is None else existing.last_restore_error,
+            runtime_signature=self._runtime_state_signature,
+        )
+        self._session_restore_store.put(snapshot)
+        with self._lock:
+            self._session_restore_counts["saved"] = (
+                self._session_restore_counts.get("saved", 0) + 1
+            )
+            self._last_slot_save = {
+                "ok": True,
+                "conversation_key_hash": _hash_key(state.conversation_id),
+                "slot_id": state.slot_id,
+                "filename": filename,
+                "save_ms": timings.get("save_ms"),
+                "n_saved": result.get("n_saved"),
+                "n_written": result.get("n_written"),
+                "timestamp": round(time.time(), 3),
+            }
+
+    def _try_restore_session_snapshot(
+        self,
+        *,
+        conversation_id: str,
+        model_id: str,
+        slot_id: int,
+    ) -> bool:
+        if not self._session_restore_enabled():
+            return False
+        snapshot = self._session_restore_store.get(
+            conversation_id=conversation_id,
+            model_id=model_id,
+            touch=False,
+        )
+        if snapshot is None:
+            with self._lock:
+                self._session_restore_counts["restore_miss"] = (
+                    self._session_restore_counts.get("restore_miss", 0) + 1
+                )
+                self._last_slot_restore = {
+                    "ok": False,
+                    "conversation_key_hash": _hash_key(conversation_id),
+                    "slot_id": slot_id,
+                    "filename": "",
+                    "status": "missing_snapshot",
+                    "timestamp": round(time.time(), 3),
+                }
+            return False
+
+        slot_save_file = self._slot_save_path / snapshot.save_filename
+        if not slot_save_file.exists():
+            snapshot.last_restore_at = time.time()
+            snapshot.last_restore_status = "missing_slot_save_file"
+            snapshot.last_restore_error = str(slot_save_file)
+            self._session_restore_store.put(snapshot)
+            with self._lock:
+                self._session_restore_counts["restore_error"] = (
+                    self._session_restore_counts.get("restore_error", 0) + 1
+                )
+                self._last_slot_restore = {
+                    "ok": False,
+                    "conversation_key_hash": _hash_key(conversation_id),
+                    "slot_id": slot_id,
+                    "filename": snapshot.save_filename,
+                    "status": snapshot.last_restore_status,
+                    "error": snapshot.last_restore_error,
+                    "timestamp": round(time.time(), 3),
+                }
+            return False
+
+        try:
+            result = self._slot_action(
+                slot_id=slot_id,
+                action="restore",
+                payload={"filename": snapshot.save_filename},
+            )
+        except Exception as exc:
+            snapshot.last_restore_at = time.time()
+            snapshot.last_restore_status = "restore_error"
+            snapshot.last_restore_error = str(exc)
+            self._session_restore_store.put(snapshot)
+            with self._lock:
+                self._session_restore_counts["restore_error"] = (
+                    self._session_restore_counts.get("restore_error", 0) + 1
+                )
+                self._last_slot_restore = {
+                    "ok": False,
+                    "conversation_key_hash": _hash_key(conversation_id),
+                    "slot_id": slot_id,
+                    "filename": snapshot.save_filename,
+                    "status": snapshot.last_restore_status,
+                    "error": snapshot.last_restore_error,
+                    "timestamp": round(time.time(), 3),
+                }
+            return False
+
+        timings = result.get("timings", {})
+        snapshot.slot_id = slot_id
+        snapshot.last_access_at = time.time()
+        snapshot.restore_count += 1
+        snapshot.last_restore_at = time.time()
+        snapshot.last_restore_ms = timings.get("restore_ms")
+        snapshot.last_restore_n_restored = int(result.get("n_restored", 0) or 0)
+        snapshot.last_restore_n_read = int(result.get("n_read", 0) or 0)
+        snapshot.last_restore_status = "restored"
+        snapshot.last_restore_error = ""
+        snapshot.runtime_signature = self._runtime_state_signature
+        self._session_restore_store.put(snapshot)
+        with self._lock:
+            self._session_restore_counts["restored"] = (
+                self._session_restore_counts.get("restored", 0) + 1
+            )
+            self._last_slot_restore = {
+                "ok": True,
+                "conversation_key_hash": _hash_key(conversation_id),
+                "slot_id": slot_id,
+                "filename": snapshot.save_filename,
+                "restore_ms": timings.get("restore_ms"),
+                "n_restored": result.get("n_restored"),
+                "n_read": result.get("n_read"),
+                "status": snapshot.last_restore_status,
+                "timestamp": round(time.time(), 3),
+            }
+        return True
+
+    def _persist_runtime_state_locked(self) -> None:
+        bindings = []
+        for session_key, binding in self._session_bindings.items():
+            bindings.append(
+                {
+                    "session_key": session_key,
+                    "binding": binding.to_dict(),
+                }
+            )
+        payload = {
+            "version": _PERSISTED_RUNTIME_STATE_VERSION,
+            "updated_at": round(time.time(), 3),
+            "runtime_signature": self._runtime_state_signature,
+            "single_slot_recovery_pending": self._single_slot_recovery_pending,
+            "single_slot_continuation": (
+                None
+                if self._single_slot_continuation is None
+                else self._serialize_continuation_state(self._single_slot_continuation)
+            ),
+            "session_bindings": bindings,
+        }
+        self._runtime_state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self._runtime_state_path.with_suffix(".tmp")
+        temp_path.write_text(
+            json.dumps(payload, sort_keys=True, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temp_path.replace(self._runtime_state_path)
+
+    def _load_runtime_state(self) -> None:
+        if not self._runtime_state_path.exists():
+            return
+        try:
+            payload = json.loads(self._runtime_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        stored_signature = str(payload.get("runtime_signature", "") or "")
+        current_signature = self._current_runtime_signature()
+        signature_matches = bool(
+            stored_signature and current_signature and stored_signature == current_signature
+        )
+        self._runtime_state_signature = current_signature or stored_signature
+
+        continuation_payload = payload.get("single_slot_continuation")
+        if isinstance(continuation_payload, dict):
+            state = self._deserialize_continuation_state(continuation_payload)
+            if state is not None:
+                self._single_slot_continuation = state
+                self._single_slot_restored_from_disk = True
+                self._single_slot_recovery_pending = not signature_matches
+
+        if signature_matches:
+            restored_bindings = OrderedDict()
+            restored_owners: Dict[int, str] = {}
+            for item in payload.get("session_bindings", []):
+                if not isinstance(item, dict):
+                    continue
+                session_key = item.get("session_key")
+                binding_payload = item.get("binding")
+                if not session_key or not isinstance(binding_payload, dict):
+                    continue
+                try:
+                    binding = SessionBinding(
+                        slot_id=int(binding_payload["slot_id"]),
+                        estimated_prompt_tokens=int(
+                            binding_payload.get("estimated_prompt_tokens", 0)
+                        ),
+                        last_used_at=float(binding_payload.get("last_used_at", 0.0)),
+                        sticky_key_hash=_hash_key(str(session_key)),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                restored_bindings[str(session_key)] = binding
+                restored_owners[binding.slot_id] = str(session_key)
+            self._session_bindings = restored_bindings
+            self._slot_owners = restored_owners
+            self._evict_oldest_binding_locked()
+        else:
+            self._session_bindings.clear()
+            self._slot_owners.clear()
+
+        with self._lock:
+            self._persist_runtime_state_locked()
+
     def _evict_oldest_binding_locked(self) -> None:
         while len(self._session_bindings) > self.config.sticky_max_sessions:
             session_key, binding = self._session_bindings.popitem(last=False)
@@ -681,6 +1165,10 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             sticky_key_hash=_hash_key(session_key),
         )
         self._evict_oldest_binding_locked()
+        current_signature = self._current_runtime_signature()
+        if current_signature:
+            self._runtime_state_signature = current_signature
+        self._persist_runtime_state_locked()
 
     def _binding_for_slot_locked(
         self,
@@ -700,6 +1188,20 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._slot_owners.pop(slot_id, None)
         if owner and binding and self._session_bindings.get(owner) is binding:
             self._session_bindings.pop(owner, None)
+        self._persist_runtime_state_locked()
+
+    def _sync_runtime_state_locked(self) -> None:
+        if not self._runtime_state_signature:
+            return
+        current_signature = self._current_runtime_signature()
+        if current_signature == self._runtime_state_signature:
+            return
+        self._session_bindings.clear()
+        self._slot_owners.clear()
+        if self._single_slot_continuation is not None:
+            self._single_slot_recovery_pending = True
+        self._runtime_state_signature = current_signature
+        self._persist_runtime_state_locked()
 
     def _record_continuation_decision(self, decision: ContinuationDecision) -> None:
         with self._lock:
@@ -719,14 +1221,90 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 else self._last_continuation_decision.to_dict()
             )
             counts = dict(self._continuation_counts)
+            recovery_pending = self._single_slot_recovery_pending
+            restored_from_disk = self._single_slot_restored_from_disk
+            runtime_signature = self._runtime_state_signature
         return {
             "enabled": self.config.enable_session_stickiness and self.config.parallel_slots <= 1,
             "ttl_seconds": int(_SINGLE_SLOT_CONTINUATION_TTL_SECONDS),
+            "recovery_pending": recovery_pending,
+            "restored_from_disk": restored_from_disk,
+            "state_path": str(self._runtime_state_path),
+            "runtime_signature": runtime_signature,
             "state": state,
             "counts": counts,
             "last_decision": last,
             "recent_decisions": recent,
         }
+
+    def _session_restore_summary(self) -> Dict[str, Any]:
+        snapshots = self._session_restore_store.list_snapshots(
+            limit=_SESSION_RESTORE_RECENT_LIMIT,
+        )
+        public_snapshots = []
+        restorable_snapshots = 0
+        for snapshot in snapshots:
+            payload = snapshot.to_public_dict()
+            slot_save_file = self._slot_save_path / snapshot.save_filename
+            payload["slot_save_exists"] = slot_save_file.exists()
+            if payload["slot_save_exists"]:
+                restorable_snapshots += 1
+            public_snapshots.append(payload)
+        with self._lock:
+            counts = dict(self._session_restore_counts)
+            last_save = None if self._last_slot_save is None else dict(self._last_slot_save)
+            last_restore = (
+                None if self._last_slot_restore is None else dict(self._last_slot_restore)
+            )
+        stats = self._session_restore_store.stats()
+        stats["restorable_snapshots"] = restorable_snapshots
+        return {
+            "enabled": self._session_restore_enabled(),
+            "slot_save_path": str(self._slot_save_path),
+            "min_prompt_tokens": self._session_restore_threshold(),
+            "stats": stats,
+            "counts": counts,
+            "last_save": last_save,
+            "last_restore": last_restore,
+            "snapshots": public_snapshots,
+        }
+
+    def _persist_session_snapshot_from_payload(
+        self,
+        *,
+        path: str,
+        payload: Dict[str, Any],
+        response_payload: Optional[Dict[str, Any]],
+    ) -> None:
+        if path not in {"v1/chat/completions", "v1/completions"}:
+            return
+        conversation_id = _extract_routing_key(payload)
+        slot_id = payload.get("id_slot")
+        if not conversation_id or not isinstance(slot_id, int):
+            return
+        if payload.get("cache_prompt") is False:
+            return
+        estimated_prompt_tokens = _estimate_prompt_tokens(payload)
+        next_state = self._build_continuation_state(
+            path,
+            payload,
+            conversation_id,
+            estimated_prompt_tokens,
+        )
+        next_state.slot_id = slot_id
+        if (
+            path == "v1/chat/completions"
+            and next_state.prompt_mode == "messages"
+            and isinstance(next_state.prompt_value, tuple)
+            and isinstance(response_payload, dict)
+        ):
+            assistant_message = _response_assistant_message(response_payload)
+            if assistant_message is not None:
+                next_state.slot_prompt_value = next_state.prompt_value + (
+                    _canonical_message(assistant_message),
+                )
+                next_state.slot_message_count = next_state.message_count + 1
+        self._persist_session_snapshot(next_state)
 
     def _build_continuation_state(
         self,
@@ -788,6 +1366,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         slot_reason_map = {
             "cold_start": "single_slot_cold_start",
             "hit": "single_slot_hit",
+            "recovery_replay": "single_slot_recovery_replay",
             "prefix_drift": "single_slot_prefix_drift",
             "shape_changed": "single_slot_shape_changed",
             "model_changed": "single_slot_model_changed",
@@ -848,16 +1427,21 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         continuation_hit = False
         prefix_drift = False
         suffix_only = False
+        restore_needed = False
+        current: Optional[ContinuationState] = None
         with self._lock:
+            self._sync_runtime_state_locked()
             current = self._single_slot_continuation
             if current is not None:
                 age_seconds = time.time() - current.last_used_at
                 if age_seconds > _SINGLE_SLOT_CONTINUATION_TTL_SECONDS:
                     reason = "expired"
                     self._single_slot_continuation = None
+                    self._persist_runtime_state_locked()
                 elif current.slot_id != 0:
                     reason = "slot_reset"
                     self._single_slot_continuation = None
+                    self._persist_runtime_state_locked()
                 elif current.conversation_id != routing_key:
                     reason = "cold_start"
                 elif current.model_id != next_state.model_id:
@@ -877,6 +1461,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     ):
                         reason = "prefix_drift"
                         prefix_drift = True
+                    elif self._single_slot_recovery_pending:
+                        restore_needed = True
                     else:
                         reason = "hit"
                         continuation_hit = True
@@ -886,13 +1472,33 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     if not prompt_value.startswith(current_prompt_value):
                         reason = "prefix_drift"
                         prefix_drift = True
+                    elif self._single_slot_recovery_pending:
+                        restore_needed = True
                     else:
                         reason = "hit"
                         continuation_hit = True
 
+        if restore_needed:
+            if self._try_restore_session_snapshot(
+                conversation_id=routing_key,
+                model_id=next_state.model_id,
+                slot_id=0,
+            ):
+                with self._lock:
+                    self._single_slot_recovery_pending = False
+                    self._single_slot_restored_from_disk = True
+                    self._persist_runtime_state_locked()
+                reason = "hit"
+                continuation_hit = True
+            else:
+                with self._lock:
+                    self._session_restore_counts["restore_fallback"] = (
+                        self._session_restore_counts.get("restore_fallback", 0) + 1
+                    )
+                reason = "recovery_replay"
+
         if continuation_hit and next_state.prompt_mode == "messages":
             messages = prepared.get("messages")
-            current = self._single_slot_continuation
             slot_prompt_value = None if current is None else current.slot_prompt_value
             slot_message_count = 0 if current is None else current.slot_message_count
             if (
@@ -931,6 +1537,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
     ) -> None:
         if path not in {"v1/chat/completions", "v1/completions"} or not response_ok:
             return
+        self._persist_session_snapshot_from_payload(
+            path=path,
+            payload=payload,
+            response_payload=response_payload,
+        )
         if self.config.parallel_slots > 1:
             return
         conversation_id = _extract_routing_key(payload)
@@ -956,7 +1567,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 )
                 next_state.slot_message_count = next_state.message_count + 1
         with self._lock:
+            self._runtime_state_signature = self._current_runtime_signature()
             self._single_slot_continuation = next_state
+            self._single_slot_recovery_pending = False
+            self._single_slot_restored_from_disk = False
+            self._persist_runtime_state_locked()
 
     def _record_slot_decision(self, decision: SlotRouteDecision) -> None:
         with self._lock:
@@ -1042,8 +1657,48 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         candidates.sort()
         return candidates[0][2]
 
+    def _maybe_restore_session_binding(
+        self,
+        *,
+        prepared: Dict[str, Any],
+        routing_key: str,
+        estimated_prompt_tokens: int,
+    ) -> Optional[int]:
+        if not self._session_restore_enabled():
+            return None
+        model_id = str(prepared.get("model", "") or "")
+        if not model_id:
+            return None
+        snapshot = self._session_restore_store.get(
+            conversation_id=routing_key,
+            model_id=model_id,
+            touch=False,
+        )
+        if snapshot is None:
+            return None
+        slot_id = max(0, min(snapshot.slot_id, self.config.parallel_slots - 1))
+        if self._try_restore_session_snapshot(
+            conversation_id=routing_key,
+            model_id=model_id,
+            slot_id=slot_id,
+        ):
+            with self._lock:
+                self._bind_session_locked(
+                    routing_key,
+                    slot_id=slot_id,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                )
+            prepared["id_slot"] = slot_id
+            return slot_id
+        with self._lock:
+            self._session_restore_counts["restore_fallback"] = (
+                self._session_restore_counts.get("restore_fallback", 0) + 1
+            )
+        return None
+
     def _slot_router_summary(self, slots_payload: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
+            self._sync_runtime_state_locked()
             bindings = [binding.to_dict() for binding in self._session_bindings.values()]
             recent = [decision.to_dict() for decision in self._recent_slot_decisions]
             last_decision = (
@@ -1158,15 +1813,21 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             return prepared
 
         with self._lock:
+            self._sync_runtime_state_locked()
             binding = self._session_bindings.get(routing_key)
             if binding and binding.slot_id >= self.config.parallel_slots:
                 self._session_bindings.pop(routing_key, None)
                 self._slot_owners.pop(binding.slot_id, None)
+                self._persist_runtime_state_locked()
                 binding = None
             if binding:
                 binding.last_used_at = time.time()
                 binding.estimated_prompt_tokens = estimated_prompt_tokens
                 self._session_bindings.move_to_end(routing_key)
+                current_signature = self._current_runtime_signature()
+                if current_signature:
+                    self._runtime_state_signature = current_signature
+                self._persist_runtime_state_locked()
                 prepared["id_slot"] = binding.slot_id
                 self._record_slot_decision(
                     SlotRouteDecision(
@@ -1181,6 +1842,26 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     )
                 )
                 return prepared
+
+        restored_slot = self._maybe_restore_session_binding(
+            prepared=prepared,
+            routing_key=routing_key,
+            estimated_prompt_tokens=estimated_prompt_tokens,
+        )
+        if restored_slot is not None:
+            self._record_slot_decision(
+                SlotRouteDecision(
+                    reason="sticky_restored",
+                    path=path,
+                    slot_id=restored_slot,
+                    estimated_prompt_tokens=estimated_prompt_tokens,
+                    sticky_key_hash=sticky_key_hash,
+                    cache_prompt=bool(prepared.get("cache_prompt", True)),
+                    explicit_slot=False,
+                    timestamp=time.time(),
+                )
+            )
+            return prepared
 
         if estimated_prompt_tokens < self.config.sticky_session_prompt_threshold:
             chosen_slot = None
@@ -1306,6 +1987,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         details.update({
             "diagnostics": self.diagnostics().to_dict(),
             "continuation": self._single_slot_summary(),
+            "session_restore": self._session_restore_summary(),
         })
         if props:
             details["props"] = props
@@ -1339,7 +2021,15 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         else:
             prepared = None
             state_payload = None
-        response = super().proxy(method, path, **kwargs)
+        try:
+            response = super().proxy(method, path, **kwargs)
+        except BackendError:
+            if isinstance(prepared, dict) and path in {"v1/chat/completions", "v1/completions"}:
+                with self._lock:
+                    if self._single_slot_continuation is not None:
+                        self._single_slot_recovery_pending = True
+                    self._persist_runtime_state_locked()
+            raise
         if isinstance(prepared, dict):
             response_payload = None
             content_type = response.headers.get("content-type", "")
@@ -1348,6 +2038,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     response_payload = response.json()
                 except Exception:
                     response_payload = None
+            elif path in {"v1/chat/completions", "v1/completions"}:
+                with self._lock:
+                    if self._single_slot_continuation is not None:
+                        self._single_slot_recovery_pending = True
+                    self._persist_runtime_state_locked()
             self._finalize_single_slot_request(
                 path,
                 state_payload if isinstance(state_payload, dict) else prepared,
@@ -1366,10 +2061,25 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 "command": self.process_manager.command(),
             }
         self._wait_until_ready()
+        with self._lock:
+            if self._single_slot_continuation is not None:
+                self._single_slot_recovery_pending = True
+            self._session_bindings.clear()
+            self._slot_owners.clear()
+            self._runtime_state_signature = self._current_runtime_signature()
+            self._persist_runtime_state_locked()
         return {**result, "mode": "llama_cpp"}
 
     def stop_runtime(self) -> Dict[str, Any]:
-        return {**self.process_manager.stop(), "mode": "llama_cpp"}
+        result = self.process_manager.stop()
+        with self._lock:
+            if self._single_slot_continuation is not None:
+                self._single_slot_recovery_pending = True
+            self._session_bindings.clear()
+            self._slot_owners.clear()
+            self._runtime_state_signature = self._current_runtime_signature()
+            self._persist_runtime_state_locked()
+        return {**result, "mode": "llama_cpp"}
 
     def runtime_logs(self, lines: int = 40) -> Dict[str, Any]:
         return {**self.process_manager.logs(lines=lines), "mode": "llama_cpp"}
@@ -1377,6 +2087,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
     def cache_report(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "continuation": self._single_slot_summary(),
+            "session_restore": self._session_restore_summary(),
         }
         props = self._request_optional_json("props")
         slots = self._request_optional_json("slots")
@@ -1386,3 +2097,580 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             payload["slots"] = slots
             payload["slot_router"] = self._slot_router_summary(slots)
         return payload
+
+    def capabilities(self) -> BackendCapabilities:
+        multimodal = infer_multimodal_capabilities(
+            self.config.artifact_path,
+            self.config.model_repo_id,
+        )
+        return BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            vision_chat=multimodal.vision_chat,
+            ocr=multimodal.ocr,
+        )
+
+
+@dataclass
+class ModelPoolEvent:
+    action: str
+    model_id: str
+    reason: str
+    timestamp: float
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "action": self.action,
+            "model_id": self.model_id,
+            "reason": self.reason,
+            "timestamp": round(self.timestamp, 3),
+        }
+
+
+@dataclass
+class _PooledModelHandle:
+    registration: LlamaCppModelRegistration
+    adapter: LlamaCppBackendAdapter
+    loaded: bool = False
+    loaded_at: Optional[float] = None
+    last_used_at: Optional[float] = None
+    last_load_reason: str = ""
+    last_unload_reason: str = ""
+    last_eviction_reason: str = ""
+    request_count: int = 0
+
+
+def _sanitize_model_dir_name(model_id: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "-", model_id).strip("-")
+    return sanitized or _hash_key(model_id)
+
+
+class LlamaCppModelPoolAdapter(BackendAdapter):
+    """Pool wrapper that manages multiple llama.cpp GGUF runtimes."""
+
+    def __init__(self, runtime_config: DGXRuntimeConfig, state_dir: Path) -> None:
+        self.runtime_config = runtime_config
+        self.config = runtime_config.backend
+        self.base_url = self.config.base_url.rstrip("/")
+        self.state_dir = Path(state_dir).expanduser().resolve() / "llama_cpp_model_pool"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._recent_events: Deque[ModelPoolEvent] = deque(maxlen=64)
+        self._models: "OrderedDict[str, _PooledModelHandle]" = OrderedDict()
+        self._default_model_id = self._resolve_default_model_id()
+
+        for model_id, registration in self._resolved_registrations().items():
+            self._register_model_locked(
+                registration,
+                is_default=(model_id == self._default_model_id),
+                initial=True,
+            )
+
+    @classmethod
+    def from_runtime_config(
+        cls,
+        runtime_config: DGXRuntimeConfig,
+        state_dir: str | Path,
+    ) -> "LlamaCppModelPoolAdapter":
+        return cls(runtime_config, Path(state_dir))
+
+    def _resolve_default_model_id(self) -> str:
+        for model_id, profile in self.runtime_config.models.items():
+            if profile.is_default:
+                return model_id
+        if self.runtime_config.models:
+            return next(iter(self.runtime_config.models.keys()))
+        if self.config.model_pool.models:
+            return next(iter(self.config.model_pool.models.keys()))
+        if self.config.model_repo_id:
+            return self.config.model_repo_id
+        if self.config.artifact_path:
+            return Path(self.config.artifact_path).stem or "default"
+        return "default"
+
+    def _resolve_model_id(self, requested: Optional[str]) -> str:
+        if requested:
+            candidate = str(requested)
+            if candidate in self._models:
+                return candidate
+            for model_id, handle in self._models.items():
+                if handle.registration.model_alias and handle.registration.model_alias == candidate:
+                    return model_id
+            return candidate
+        return self._default_model_id
+
+    def _derive_model_base_url(self, ordinal: int) -> str:
+        parsed = urlparse(self.config.base_url)
+        scheme = parsed.scheme or "http"
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 30000
+        path = parsed.path.rstrip("/")
+        suffix = f"{path}" if path else ""
+        return f"{scheme}://{host}:{port + ordinal}{suffix}"
+
+    def _resolved_registrations(self) -> "OrderedDict[str, LlamaCppModelRegistration]":
+        resolved: "OrderedDict[str, LlamaCppModelRegistration]" = OrderedDict()
+        explicit = self.config.model_pool.models
+
+        primary_profile = self.runtime_config.models.get(self._default_model_id)
+        if self._default_model_id not in explicit:
+            primary_artifact_path = self.config.artifact_path
+            resolved[self._default_model_id] = LlamaCppModelRegistration(
+                model_id=self._default_model_id,
+                model_alias=None if primary_profile is None else primary_profile.model_alias,
+                model_repo_id="" if primary_artifact_path else self.config.model_repo_id,
+                artifact_path=primary_artifact_path,
+                gguf_variant=self.config.gguf_variant,
+                base_url=self.config.base_url,
+                launcher_cmd=self.config.launcher_cmd,
+                serving_preset=self.config.serving_preset,
+                ctx_size=self.config.ctx_size,
+                parallel_slots=self.config.parallel_slots,
+                pinned=True,
+                ttl_seconds=0,
+                idle_unload_seconds=0,
+            )
+
+        for model_id, registration in explicit.items():
+            profile = self.runtime_config.models.get(model_id)
+            ordinal = 0 if model_id == self._default_model_id else len(resolved)
+            artifact_path = registration.artifact_path or self.config.artifact_path
+            resolved[model_id] = LlamaCppModelRegistration(
+                model_id=model_id,
+                model_alias=registration.model_alias
+                or (None if profile is None else profile.model_alias),
+                model_repo_id=registration.model_repo_id
+                or ("" if artifact_path else self.config.model_repo_id),
+                artifact_path=artifact_path,
+                gguf_variant=registration.gguf_variant or self.config.gguf_variant,
+                base_url=registration.base_url
+                or (self.config.base_url if model_id == self._default_model_id else self._derive_model_base_url(ordinal)),
+                launcher_cmd=registration.launcher_cmd,
+                serving_preset=registration.serving_preset,
+                ctx_size=registration.ctx_size,
+                parallel_slots=registration.parallel_slots,
+                pinned=registration.pinned,
+                ttl_seconds=registration.ttl_seconds
+                or self.config.model_pool.default_ttl_seconds,
+                idle_unload_seconds=registration.idle_unload_seconds
+                or self.config.model_pool.default_idle_unload_seconds,
+            )
+        return resolved
+
+    def _adapter_config_for_registration(
+        self,
+        registration: LlamaCppModelRegistration,
+    ) -> BackendConfig:
+        child_config = replace(
+            self.config,
+            base_url=registration.base_url or self.config.base_url,
+            model_repo_id=registration.model_repo_id
+            or ("" if registration.artifact_path else self.config.model_repo_id),
+            artifact_path=registration.artifact_path or self.config.artifact_path,
+            gguf_variant=registration.gguf_variant or self.config.gguf_variant,
+            launcher_cmd=registration.launcher_cmd,
+            model_pool=self.config.model_pool,
+        )
+        if registration.serving_preset:
+            apply_llama_cpp_serving_preset(child_config, registration.serving_preset)
+        if registration.ctx_size > 0:
+            child_config.ctx_size = registration.ctx_size
+        if registration.parallel_slots > 0:
+            child_config.parallel_slots = registration.parallel_slots
+        return child_config
+
+    def _record_event_locked(self, action: str, model_id: str, reason: str) -> None:
+        self._recent_events.append(
+            ModelPoolEvent(
+                action=action,
+                model_id=model_id,
+                reason=reason,
+                timestamp=time.time(),
+            )
+        )
+
+    def _register_model_locked(
+        self,
+        registration: LlamaCppModelRegistration,
+        *,
+        is_default: bool,
+        initial: bool,
+    ) -> None:
+        existing = self._models.get(registration.model_id)
+        if existing is not None and existing.loaded:
+            self._unload_model_locked(
+                registration.model_id,
+                reason="registration_updated",
+            )
+
+        model_state_dir = self.state_dir / _sanitize_model_dir_name(registration.model_id)
+        adapter = LlamaCppBackendAdapter.from_backend_config(
+            self._adapter_config_for_registration(registration),
+            model_state_dir,
+        )
+        handle = _PooledModelHandle(registration=registration, adapter=adapter)
+        if adapter.process_manager.is_running():
+            now = time.time()
+            handle.loaded = True
+            handle.loaded_at = now
+            handle.last_used_at = now
+            handle.last_load_reason = "discovered_running"
+        self._models[registration.model_id] = handle
+        if is_default:
+            self._default_model_id = registration.model_id
+        if not initial:
+            self._record_event_locked("register", registration.model_id, "registered")
+
+    def register_model(
+        self,
+        registration: LlamaCppModelRegistration,
+        *,
+        is_default: bool = False,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            self._register_model_locked(
+                registration,
+                is_default=is_default,
+                initial=False,
+            )
+            return self.model_pool_diagnostics()
+
+    def _require_handle_locked(self, model_id: str) -> _PooledModelHandle:
+        handle = self._models.get(model_id)
+        if handle is None:
+            raise BackendError(f"unknown llama.cpp pool model: {model_id}")
+        return handle
+
+    def _loaded_items_locked(self) -> List[tuple[str, _PooledModelHandle]]:
+        return [
+            (model_id, handle)
+            for model_id, handle in self._models.items()
+            if handle.loaded
+        ]
+
+    def _capacity_locked(self) -> int:
+        return max(1, int(self.config.model_pool.max_loaded_models))
+
+    def _unload_model_locked(self, model_id: str, *, reason: str) -> Dict[str, Any]:
+        handle = self._require_handle_locked(model_id)
+        if not handle.loaded:
+            return {"model_id": model_id, "loaded": False, "reason": "not_loaded"}
+        result = handle.adapter.stop_runtime()
+        handle.loaded = False
+        handle.loaded_at = None
+        handle.last_unload_reason = reason
+        if "eviction" in reason:
+            handle.last_eviction_reason = reason
+        self._record_event_locked("unload", model_id, reason)
+        return {
+            "model_id": model_id,
+            "loaded": False,
+            "reason": reason,
+            "result": result,
+        }
+
+    def _lru_evictable_models_locked(
+        self,
+        *,
+        exclude_model_id: Optional[str] = None,
+    ) -> List[tuple[float, str]]:
+        candidates: List[tuple[float, str]] = []
+        for model_id, handle in self._loaded_items_locked():
+            if model_id == exclude_model_id or handle.registration.pinned:
+                continue
+            score = handle.last_used_at or handle.loaded_at or 0.0
+            candidates.append((score, model_id))
+        candidates.sort()
+        return candidates
+
+    def _enforce_policies_locked(
+        self,
+        *,
+        exclude_model_id: Optional[str] = None,
+    ) -> None:
+        now = time.time()
+        for model_id, handle in list(self._models.items()):
+            if not handle.loaded or handle.registration.pinned or model_id == exclude_model_id:
+                continue
+            ttl_seconds = handle.registration.ttl_seconds
+            if ttl_seconds > 0 and handle.loaded_at is not None:
+                if now - handle.loaded_at >= ttl_seconds:
+                    self._unload_model_locked(model_id, reason="ttl_expired")
+                    continue
+            idle_unload_seconds = handle.registration.idle_unload_seconds
+            if idle_unload_seconds > 0 and handle.last_used_at is not None:
+                if now - handle.last_used_at >= idle_unload_seconds:
+                    self._unload_model_locked(model_id, reason="idle_timeout")
+
+    def _ensure_capacity_locked(self, target_model_id: str) -> None:
+        while len(self._loaded_items_locked()) >= self._capacity_locked():
+            candidates = self._lru_evictable_models_locked(exclude_model_id=target_model_id)
+            if not candidates:
+                raise BackendError(
+                    "model pool is at capacity and all loaded models are pinned"
+                )
+            _, victim_model_id = candidates[0]
+            self._unload_model_locked(victim_model_id, reason="lru_eviction")
+
+    def load_model(self, model_id: str, *, reason: str = "manual_load") -> Dict[str, Any]:
+        with self._lock:
+            resolved_model_id = self._resolve_model_id(model_id)
+            handle = self._require_handle_locked(resolved_model_id)
+            self._enforce_policies_locked(exclude_model_id=resolved_model_id)
+            if handle.loaded:
+                handle.last_used_at = time.time()
+                return {
+                    "model_id": resolved_model_id,
+                    "loaded": True,
+                    "reason": "already_loaded",
+                    "pool": self.model_pool_diagnostics(),
+                }
+            self._ensure_capacity_locked(resolved_model_id)
+            result = handle.adapter.start_runtime()
+            now = time.time()
+            handle.loaded = True
+            handle.loaded_at = now
+            handle.last_used_at = now
+            handle.last_load_reason = reason
+            handle.last_unload_reason = ""
+            self._record_event_locked("load", resolved_model_id, reason)
+            return {
+                "model_id": resolved_model_id,
+                "loaded": True,
+                "reason": reason,
+                "result": result,
+                "pool": self.model_pool_diagnostics(),
+            }
+
+    def unload_model(self, model_id: str, *, reason: str = "manual_unload") -> Dict[str, Any]:
+        with self._lock:
+            resolved_model_id = self._resolve_model_id(model_id)
+            result = self._unload_model_locked(resolved_model_id, reason=reason)
+            result["pool"] = self.model_pool_diagnostics()
+            return result
+
+    def set_model_pin(self, model_id: str, pinned: bool) -> Dict[str, Any]:
+        with self._lock:
+            resolved_model_id = self._resolve_model_id(model_id)
+            handle = self._require_handle_locked(resolved_model_id)
+            handle.registration.pinned = bool(pinned)
+            self._record_event_locked(
+                "pin",
+                resolved_model_id,
+                "pinned" if pinned else "unpinned",
+            )
+            return {
+                "model_id": resolved_model_id,
+                "pinned": handle.registration.pinned,
+                "pool": self.model_pool_diagnostics(),
+            }
+
+    def _touch_model_locked(self, model_id: str) -> None:
+        handle = self._require_handle_locked(model_id)
+        now = time.time()
+        handle.last_used_at = now
+        if handle.loaded_at is None:
+            handle.loaded_at = now
+        handle.request_count += 1
+        self._models.move_to_end(model_id)
+
+    def model_pool_diagnostics(self) -> Dict[str, Any]:
+        with self._lock:
+            self._enforce_policies_locked()
+            items: List[Dict[str, Any]] = []
+            now = time.time()
+            loaded_models: List[str] = []
+            for model_id, handle in self._models.items():
+                if handle.loaded:
+                    loaded_models.append(model_id)
+                ttl_remaining = None
+                if handle.loaded and handle.loaded_at is not None and handle.registration.ttl_seconds > 0:
+                    ttl_remaining = max(
+                        0.0,
+                        handle.registration.ttl_seconds - (now - handle.loaded_at),
+                    )
+                idle_remaining = None
+                if (
+                    handle.loaded
+                    and handle.last_used_at is not None
+                    and handle.registration.idle_unload_seconds > 0
+                ):
+                    idle_remaining = max(
+                        0.0,
+                        handle.registration.idle_unload_seconds - (now - handle.last_used_at),
+                    )
+                items.append(
+                    {
+                        "model_id": model_id,
+                        "model_alias": handle.registration.model_alias,
+                        "loaded": handle.loaded,
+                        "pinned": handle.registration.pinned,
+                        "base_url": handle.registration.base_url or handle.adapter.base_url,
+                        "model_repo_id": handle.registration.model_repo_id,
+                        "artifact_path": handle.registration.artifact_path,
+                        "gguf_variant": handle.registration.gguf_variant,
+                        "serving_preset": handle.registration.serving_preset,
+                        "ctx_size": handle.registration.ctx_size or handle.adapter.config.ctx_size,
+                        "parallel_slots": handle.registration.parallel_slots
+                        or handle.adapter.config.parallel_slots,
+                        "ttl_seconds": handle.registration.ttl_seconds,
+                        "ttl_remaining_seconds": (
+                            None if ttl_remaining is None else round(ttl_remaining, 3)
+                        ),
+                        "idle_unload_seconds": handle.registration.idle_unload_seconds,
+                        "idle_remaining_seconds": (
+                            None if idle_remaining is None else round(idle_remaining, 3)
+                        ),
+                        "loaded_at": None if handle.loaded_at is None else round(handle.loaded_at, 3),
+                        "last_used_at": (
+                            None if handle.last_used_at is None else round(handle.last_used_at, 3)
+                        ),
+                        "last_load_reason": handle.last_load_reason,
+                        "last_unload_reason": handle.last_unload_reason,
+                        "last_eviction_reason": handle.last_eviction_reason,
+                        "request_count": handle.request_count,
+                        "capabilities": {
+                            "vision_chat": handle.registration.supports_vision,
+                            "ocr": handle.registration.supports_ocr,
+                        },
+                    }
+                )
+            return {
+                "enabled": True,
+                "default_model_id": self._default_model_id,
+                "max_loaded_models": self._capacity_locked(),
+                "loaded_models": loaded_models,
+                "models": items,
+                "recent_events": [event.to_dict() for event in self._recent_events],
+            }
+
+    def _focus_model_id_locked(self) -> str:
+        default_handle = self._models.get(self._default_model_id)
+        if default_handle is not None and default_handle.loaded:
+            return self._default_model_id
+        for model_id, handle in self._models.items():
+            if handle.loaded:
+                return model_id
+        if self._default_model_id in self._models:
+            return self._default_model_id
+        if self._models:
+            return next(iter(self._models.keys()))
+        return self._default_model_id
+
+    def health(self) -> bool:
+        with self._lock:
+            self._enforce_policies_locked()
+            loaded_handles = self._loaded_items_locked()
+            if not loaded_handles:
+                return False
+            return any(handle.adapter.health() for _, handle in loaded_handles)
+
+    def list_models(self) -> dict:
+        with self._lock:
+            data = []
+            for model_id, handle in self._models.items():
+                data.append(
+                    {
+                        "id": handle.registration.model_alias or model_id,
+                        "root": model_id,
+                        "loaded": handle.loaded,
+                        "default": model_id == self._default_model_id,
+                    }
+                )
+        return {"object": "list", "data": data}
+
+    def proxy(self, method: str, path: str, **kwargs: Any):
+        payload = kwargs.get("json")
+        requested_model = payload.get("model") if isinstance(payload, dict) else None
+        with self._lock:
+            model_id = self._resolve_model_id(requested_model)
+        load_result = self.load_model(model_id, reason="request")
+        if not load_result.get("loaded"):
+            raise BackendError(f"failed to load model: {model_id}")
+        with self._lock:
+            handle = self._require_handle_locked(model_id)
+        if isinstance(payload, dict):
+            payload = dict(payload)
+            payload.setdefault("model", model_id)
+            kwargs["json"] = payload
+        response = handle.adapter.proxy(method, path, **kwargs)
+        with self._lock:
+            self._touch_model_locked(model_id)
+            self._enforce_policies_locked(exclude_model_id=model_id)
+        return response
+
+    def collect_metrics(self) -> RuntimeMetrics:
+        with self._lock:
+            self._enforce_policies_locked()
+            focus_model_id = self._focus_model_id_locked()
+            focus_handle = self._models.get(focus_model_id)
+            loaded_handles = self._loaded_items_locked()
+        if focus_handle is None:
+            metrics = RuntimeMetrics(backend_url=self.base_url, healthy=False)
+        else:
+            metrics = focus_handle.adapter.collect_metrics()
+        details = dict(metrics.details or {})
+        details["model_pool"] = self.model_pool_diagnostics()
+        details["focus_model_id"] = focus_model_id
+        metrics.details = details
+        if loaded_handles:
+            metrics.healthy = any(handle.adapter.health() for _, handle in loaded_handles)
+        return metrics
+
+    def start_runtime(self) -> Dict[str, Any]:
+        return self.load_model(self._default_model_id, reason="manual_start")
+
+    def stop_runtime(self) -> Dict[str, Any]:
+        with self._lock:
+            stopped = []
+            for model_id, handle in list(self._models.items()):
+                if handle.loaded:
+                    stopped.append(self._unload_model_locked(model_id, reason="manual_stop"))
+            return {
+                "mode": "llama_cpp_pool",
+                "stopped_models": stopped,
+                "pool": self.model_pool_diagnostics(),
+            }
+
+    def runtime_logs(self, lines: int = 40) -> Dict[str, Any]:
+        with self._lock:
+            logs = {
+                model_id: handle.adapter.runtime_logs(lines=lines)
+                for model_id, handle in self._models.items()
+                if handle.loaded
+            }
+        return {
+            "mode": "llama_cpp_pool",
+            "logs": logs,
+            "pool": self.model_pool_diagnostics(),
+        }
+
+    def cache_report(self) -> Dict[str, Any]:
+        with self._lock:
+            self._enforce_policies_locked()
+            focus_model_id = self._focus_model_id_locked()
+            focus_handle = self._models.get(focus_model_id)
+        payload: Dict[str, Any] = {
+            "model_pool": self.model_pool_diagnostics(),
+            "focus_model_id": focus_model_id,
+        }
+        if focus_handle is not None and focus_handle.loaded:
+            payload["focus_model"] = focus_handle.adapter.cache_report()
+        return payload
+
+    def capabilities(self) -> BackendCapabilities:
+        focus_handle = self._models.get(self._default_model_id)
+        if focus_handle is None and self._models:
+            focus_handle = next(iter(self._models.values()))
+        if focus_handle is None:
+            return BackendCapabilities()
+        capabilities = focus_handle.adapter.capabilities()
+        registration = focus_handle.registration
+        return BackendCapabilities(
+            chat_completions=capabilities.chat_completions,
+            completions=capabilities.completions,
+            embeddings=capabilities.embeddings,
+            rerank=capabilities.rerank,
+            vision_chat=capabilities.vision_chat and registration.supports_vision,
+            ocr=capabilities.ocr and registration.supports_ocr,
+        )
