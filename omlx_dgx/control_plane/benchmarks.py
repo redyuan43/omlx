@@ -36,7 +36,7 @@ _BENCHMARK_SPECS: Dict[str, BenchmarkSpec] = {
     "multimodal-smoke": BenchmarkSpec(
         name="multimodal-smoke",
         script_path="scripts/bench_multimodal_smoke.py",
-        description="DGX multimodal routing smoke benchmark for image chat and OCR capability gating.",
+        description="DGX capability smoke benchmark for embeddings, rerank, image chat, and OCR routing.",
     ),
 }
 
@@ -44,6 +44,10 @@ _CLI_OPTION_TYPES: Dict[str, str] = {
     "control_plane_url": "str",
     "runtime_url": "str",
     "model": "str",
+    "vision_model": "str",
+    "ocr_model": "str",
+    "embedding_model": "str",
+    "rerank_model": "str",
     "long_prefix_repeat": "int",
     "long_output_max_tokens": "int",
     "target_context_tokens": "int",
@@ -57,7 +61,7 @@ def _utc_now() -> str:
 
 
 def _report_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
+    summary = {
         "report_id": payload.get("report_id"),
         "benchmark": payload.get("benchmark"),
         "created_at": payload.get("created_at"),
@@ -73,6 +77,9 @@ def _report_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
             .get("runtime_url")
         ),
     }
+    report_summary = payload.get("report", {}).get("summary")
+    summary["summary"] = report_summary if isinstance(report_summary, dict) else None
+    return summary
 
 
 class BenchmarkReportStore:
@@ -148,6 +155,14 @@ class BenchmarkReportStore:
             for path in reports[: max(1, limit)]
         ]
 
+    def latest_summaries(self) -> Dict[str, Dict[str, Any]]:
+        summaries: Dict[str, Dict[str, Any]] = {}
+        for benchmark_name in _BENCHMARK_SPECS:
+            latest = self.latest_report(benchmark_name)
+            if latest is not None:
+                summaries[benchmark_name] = _report_summary(latest)
+        return summaries
+
 
 class BenchmarkManager:
     def __init__(self, state_dir: str | Path) -> None:
@@ -165,6 +180,9 @@ class BenchmarkManager:
                 }
             )
         return entries
+
+    def latest_summaries(self) -> Dict[str, Dict[str, Any]]:
+        return self.store.latest_summaries()
 
     def latest_report(self, benchmark_name: str) -> Optional[Dict[str, Any]]:
         self._require_spec(benchmark_name)

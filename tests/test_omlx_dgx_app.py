@@ -224,10 +224,26 @@ def test_control_plane_rewrites_model_alias(tmp_path: Path):
 
 def test_admin_runtime_endpoint_returns_metrics(tmp_path: Path):
     settings = DGXSettingsManager(tmp_path / "state")
+    manager = BenchmarkManager(tmp_path / "bench-state")
+    manager.store.write_report(
+        "multimodal-smoke",
+        command=["python3", "scripts/bench_multimodal_smoke.py"],
+        request_overrides={},
+        report={
+            "summary": {
+                "embeddings_ok": True,
+                "rerank_ok": True,
+                "vision_ok": True,
+                "ocr_ok": True,
+            }
+        },
+        duration_sec=0.123,
+    )
     app = create_app(
         settings_manager=settings,
         backend=FakeBackend(),
         manifest_store=PersistentManifestStore(tmp_path / "cache"),
+        benchmark_manager=manager,
     )
 
     response = _request(app, "GET", "/admin/api/runtime")
@@ -235,6 +251,7 @@ def test_admin_runtime_endpoint_returns_metrics(tmp_path: Path):
     assert response.json()["backend"]["gpu_name"] == "Fake GPU"
     assert response.json()["backend"]["details"]["session_restore"]["enabled"] is True
     assert response.json()["capabilities"]["services"]["/v1/messages"]["supported"] is True
+    assert response.json()["benchmark_summaries"]["multimodal-smoke"]["summary"]["embeddings_ok"] is True
     assert response.json()["hicache_storage"]["hicache_storage_backend"] == "file"
     assert response.json()["cache_report"]["enable_cache_report"] is True
 
@@ -722,3 +739,4 @@ def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path
     assert latest.status_code == 200
     assert latest.json()["report_id"] == report_id
     assert latest.json()["report"]["single_session_followup"]["summary"]["followup_avg_sec"] == 0.123
+    assert reports.json()["reports"][0]["summary"] is None or isinstance(reports.json()["reports"][0]["summary"], dict)

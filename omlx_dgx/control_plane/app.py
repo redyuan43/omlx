@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -875,6 +876,7 @@ def create_app(
             "backend": services.backend.collect_metrics().to_dict(),
             "cold_store": services.manifest_store.stats(),
             "capabilities": _service_capabilities(services),
+            "benchmark_summaries": services.benchmark_manager.latest_summaries(),
         }
         for key, func in (
             ("hicache_storage", services.backend.hicache_storage_status),
@@ -1062,7 +1064,8 @@ def create_app(
         if not isinstance(body, dict):
             raise HTTPException(status_code=400, detail="benchmark request body must be an object")
         try:
-            return services.benchmark_manager.run_benchmark(
+            return await asyncio.to_thread(
+                services.benchmark_manager.run_benchmark,
                 benchmark_name,
                 overrides=body,
             )
