@@ -1,56 +1,85 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-omlx: LLM inference server, optimized for your Mac
+omlx: LLM inference server, optimized for your Mac.
 
-This package provides native Apple Silicon GPU acceleration using
-Apple's MLX framework and mlx-lm for LLMs.
-
-Features:
-- Continuous batching via vLLM-style scheduler
-- OpenAI-compatible API server
-- Paged KV cache with prefix sharing
-- Tiered cache (GPU + paged SSD offloading)
+The MLX-backed engine is optional at import time so pure schema/control-plane
+modules remain usable on non-Apple hosts such as Jetson.
 """
 
+from __future__ import annotations
+
+from importlib import import_module
+
 from omlx._version import __version__
-
-# Continuous batching engine (core functionality, no torch required)
 from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
-from omlx.scheduler import Scheduler, SchedulerConfig, SchedulerOutput
-from omlx.engine_core import EngineCore, AsyncEngineCore, EngineConfig
-from omlx.cache.prefix_cache import BlockAwarePrefixCache
-from omlx.cache.paged_cache import PagedCacheManager, CacheBlock, BlockTable
-from omlx.cache.stats import PrefixCacheStats, PagedCacheStats
-from omlx.model_registry import get_registry, ModelOwnershipError
 
-# Backward compatibility alias
-CacheStats = PagedCacheStats
+_LAZY_EXPORTS = {
+    "Scheduler": ("omlx.scheduler", "Scheduler"),
+    "SchedulerConfig": ("omlx.scheduler", "SchedulerConfig"),
+    "SchedulerOutput": ("omlx.scheduler", "SchedulerOutput"),
+    "EngineCore": ("omlx.engine_core", "EngineCore"),
+    "AsyncEngineCore": ("omlx.engine_core", "AsyncEngineCore"),
+    "EngineConfig": ("omlx.engine_core", "EngineConfig"),
+    "BlockAwarePrefixCache": ("omlx.cache.prefix_cache", "BlockAwarePrefixCache"),
+    "PagedCacheManager": ("omlx.cache.paged_cache", "PagedCacheManager"),
+    "CacheBlock": ("omlx.cache.paged_cache", "CacheBlock"),
+    "BlockTable": ("omlx.cache.paged_cache", "BlockTable"),
+    "PrefixCacheStats": ("omlx.cache.stats", "PrefixCacheStats"),
+    "PagedCacheStats": ("omlx.cache.stats", "PagedCacheStats"),
+    "get_registry": ("omlx.model_registry", "get_registry"),
+    "ModelOwnershipError": ("omlx.model_registry", "ModelOwnershipError"),
+}
 
 __all__ = [
-    # Request management
     "Request",
     "RequestOutput",
     "RequestStatus",
     "SamplingParams",
-    # Scheduler
     "Scheduler",
     "SchedulerConfig",
     "SchedulerOutput",
-    # Engine
     "EngineCore",
     "AsyncEngineCore",
     "EngineConfig",
-    # Model registry
     "get_registry",
     "ModelOwnershipError",
-    # Prefix cache (paged SSD-only)
     "BlockAwarePrefixCache",
-    # Paged cache (memory efficiency)
     "PagedCacheManager",
     "CacheBlock",
     "BlockTable",
+    "PrefixCacheStats",
     "PagedCacheStats",
-    "CacheStats",  # Backward compatibility alias
-    # Version
+    "CacheStats",
     "__version__",
 ]
+
+
+def __getattr__(name: str):
+    if name == "CacheStats":
+        value = __getattr__("PagedCacheStats")
+        globals()[name] = value
+        return value
+
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module 'omlx' has no attribute {name!r}")
+
+    module_name, attr_name = target
+    try:
+        module = import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name and exc.name.startswith("mlx"):
+            raise ModuleNotFoundError(
+                f"{name} requires the MLX runtime. Install MLX dependencies to use {name}."
+            ) from exc
+        raise
+
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    if name == "PagedCacheStats":
+        globals()["CacheStats"] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
