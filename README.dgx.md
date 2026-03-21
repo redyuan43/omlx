@@ -32,6 +32,57 @@ This does not yet fork SGLang or TensorRT-LLM internals. Instead, it provides
 the control plane and runtime/storage interfaces that the DGX path can build on
 next.
 
+## Mac Path vs DGX Path
+
+The DGX path is not a full port of the Mac runtime. Today it reuses oMLX
+control-plane ideas on top of DGX backends, rather than reusing the Apple
+Silicon MLX/Metal inference stack directly.
+
+### 1. Mac/oMLX Optimizations
+
+The Mac path in [README.md](README.md) includes:
+
+- MLX-native inference via `MLX`, `mlx-lm`, and `mlx-vlm`
+- Apple Silicon and Metal specific runtime/kernel optimizations
+- the native oMLX runtime path for continuous batching
+- hot-memory plus cold-SSD KV caching with prefix sharing and paged cache style behavior
+- the full Mac product layer: admin UI, model downloader, integrations, and menu bar app
+
+### 2. What DGX/Jetson Already Reuses
+
+The DGX path already carries over these oMLX ideas:
+
+- control-plane scheduling and runtime orchestration
+- conversation stickiness for long prompts
+- slot assignment for warm follow-up requests
+- slot save/restore plus persisted session metadata
+- managed model-pool behavior: pin, TTL, idle unload, LRU, and manual load/unload
+- capability-aware routing for chat, completions, messages, embeddings, rerank, VLM, and OCR
+- backend-agnostic block metadata, scheduler policy, and tiered-KV manifest metadata
+
+### 3. What Is Not Ported Yet
+
+These parts of the Mac path are still Apple-only or otherwise absent on DGX:
+
+- the MLX runtime itself
+- Apple Silicon and Metal execution kernels
+- the native Mac cache engine implementation
+- a backend replacement for `llama.cpp` cache internals
+- the macOS app and menu bar integration layer
+
+For the current `llama.cpp` path, the important detail is that DGX adds
+oMLX-style scheduling on top of `llama.cpp`; it does not replace
+`llama.cpp`'s cache engine.
+
+### 4. Highest-Value Next Steps For Jetson
+
+For the current Jetson AGX Orin workload, the most valuable next ports are:
+
+- a real cache-reuse or prefix-cache path that works with `Qwen3.5` hybrid recurrent models
+- stronger incremental long-context reuse for "same base prompt plus small delta" requests
+- a more concrete tiered-KV cold-store path beyond metadata and restore manifests
+- broader concurrent scheduling once the single-session and long-prefix path is stable
+
 ## Current DGX Capability Matrix
 
 The current DGX path now supports four capability classes behind the same

@@ -66,6 +66,13 @@ model-level gating, plus stable benchmark report retrieval under
 `/admin/api/benchmarks`. The current DGX Spark defaults are split into two
 named presets:
 
+This DGX path reuses oMLX control-plane and scheduling ideas, but it does not
+port the Apple Silicon MLX/Metal runtime itself. The current DGX/Jetson gains
+come mainly from session stickiness, slot save/restore, persisted session
+metadata, and model-pool policy on top of backend-specific runtimes such as
+`llama.cpp`. For the DGX-specific architecture, ported ideas, and current gaps
+versus the Mac path, see [README.dgx.md](README.dgx.md).
+
 - `single_session_low_latency` for one local long-running chat (`parallel_slots=1`, `ctx_size=32768`)
 - `mixed_traffic` for long-context + short-request concurrency (`parallel_slots=2`, `ctx_size=32768`)
 
