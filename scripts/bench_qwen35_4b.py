@@ -87,6 +87,120 @@ def _build_long_prefix(prefix_unit: str, target_tokens: int) -> tuple[str, int, 
     return prefix, repeat, estimated_tokens
 
 
+def _runtime_json(
+    runtime_url: str,
+    path: str,
+    *,
+    method: str = "POST",
+    payload: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    path = path if path.startswith("/") else f"/{path}"
+    return _http_json(
+        f"{runtime_url.rstrip('/')}{path}",
+        method=method,
+        payload=payload,
+    )
+
+
+def _tokenize_content(runtime_url: str, text: str) -> list[int] | None:
+    if not runtime_url:
+        return None
+    try:
+        response = _runtime_json(
+            runtime_url,
+            "/tokenize",
+            method="POST",
+            payload={"content": text},
+        )
+    except Exception:
+        return None
+    tokens = response.get("tokens")
+    if not isinstance(tokens, list):
+        return None
+    normalized: list[int] = []
+    for token in tokens:
+        try:
+            normalized.append(int(token))
+        except Exception:
+            return None
+    return normalized
+
+
+def _detokenize_tokens(runtime_url: str, tokens: list[int]) -> str | None:
+    if not runtime_url:
+        return None
+    try:
+        response = _runtime_json(
+            runtime_url,
+            "/detokenize",
+            method="POST",
+            payload={"tokens": [int(token) for token in tokens]},
+        )
+    except Exception:
+        return None
+    content = response.get("content")
+    if not isinstance(content, str):
+        return None
+    return content
+
+
+def _build_incremental_suffix(
+    runtime_url: str,
+    base_prompt: str,
+    target_delta_tokens: int,
+) -> Dict[str, Any]:
+    fallback_suffix = " a" * max(1, int(target_delta_tokens or 0))
+    base_tokens = _tokenize_content(runtime_url, base_prompt)
+    fallback = {
+        "suffix": fallback_suffix,
+        "mode": "estimated",
+        "fragment": " a",
+        "token_id": None,
+        "base_prompt_tokens": None if base_tokens is None else len(base_tokens),
+        "actual_delta_tokens": None,
+    }
+    if target_delta_tokens <= 0 or base_tokens is None:
+        return fallback
+
+    candidate_fragments = (
+        " a",
+        " b",
+        " c",
+        " 1",
+        " cache",
+        " token",
+        " context",
+        "\n-",
+    )
+    base_count = len(base_tokens)
+    for fragment in candidate_fragments:
+        fragment_tokens = _tokenize_content(runtime_url, fragment)
+        if not fragment_tokens or len(fragment_tokens) != 1:
+            continue
+        suffix_tokens = fragment_tokens * target_delta_tokens
+        suffix = _detokenize_tokens(runtime_url, suffix_tokens)
+        if not suffix:
+            continue
+        combined_tokens = _tokenize_content(runtime_url, f"{base_prompt}{suffix}")
+        if combined_tokens is None:
+            continue
+        actual_delta = len(combined_tokens) - base_count
+        if actual_delta == target_delta_tokens:
+            return {
+                "suffix": suffix,
+                "mode": "exact_repeat_single_token",
+                "fragment": fragment,
+                "token_id": fragment_tokens[0],
+                "base_prompt_tokens": base_count,
+                "actual_delta_tokens": actual_delta,
+            }
+
+    combined_tokens = _tokenize_content(runtime_url, f"{base_prompt}{fallback_suffix}")
+    if combined_tokens is not None:
+        fallback["actual_delta_tokens"] = len(combined_tokens) - base_count
+    return fallback
+
+
 def _runtime_memory_usage(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
     backend = runtime_payload.get("backend", {})
     server_info = (
@@ -405,6 +519,7 @@ def _run_case(
             None if decode_token_per_second is None else round(decode_token_per_second, 3)
         ),
         "usage": usage,
+        "timings": response.get("timings"),
         "cached_prompt_tokens": (
             usage.get("prompt_tokens_details", {}) or {}
         ).get("cached_tokens"),
@@ -504,6 +619,7 @@ def _run_messages_case(
             else None
         ),
         "usage": usage,
+        "timings": response.get("timings"),
         "cached_prompt_tokens": (
             usage.get("prompt_tokens_details", {}) or {}
         ).get("cached_tokens"),
@@ -537,6 +653,156 @@ def _run_messages_case(
     }
 
 
+def _run_completion_case(
+    *,
+    control_plane_url: str,
+    runtime_url: str,
+    model: str,
+    prompt: str,
+    max_tokens: int,
+    conversation_id: str | None = None,
+) -> Dict[str, Any]:
+    before = _snapshot(control_plane_url, runtime_url)
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    if conversation_id:
+        payload["metadata"] = {"conversation_id": conversation_id}
+
+    started = time.perf_counter()
+    response = _http_json(
+        f"{control_plane_url}/v1/completions",
+        method="POST",
+        payload=payload,
+    )
+    wall_time = time.perf_counter() - started
+    after = _snapshot(control_plane_url, runtime_url)
+    usage = response.get("usage", {})
+    completion_tokens = usage.get("completion_tokens", 0) or 0
+    continuation_after = (
+        after["runtime"]
+        .get("backend", {})
+        .get("details", {})
+        .get("continuation", {})
+        .get("last_decision")
+    )
+    session_restore_after = (
+        after["runtime"]
+        .get("backend", {})
+        .get("details", {})
+        .get("session_restore", {})
+    )
+    return {
+        "wall_time_sec": round(wall_time, 3),
+        "token_per_second": (
+            round(completion_tokens / max(wall_time, 1e-6), 3)
+            if completion_tokens
+            else None
+        ),
+        "usage": usage,
+        "timings": response.get("timings"),
+        "cached_prompt_tokens": (
+            usage.get("prompt_tokens_details", {}) or {}
+        ).get("cached_tokens"),
+        "assistant": {"role": "assistant", "content": response["choices"][0]["text"]},
+        "system_mem_before_kib": before["meminfo"],
+        "system_mem_after_kib": after["meminfo"],
+        "runtime_memory_before": _runtime_memory_usage(before["runtime"]),
+        "runtime_memory_after": _runtime_memory_usage(after["runtime"]),
+        "route_after": (
+            after["runtime"]
+            .get("backend", {})
+            .get("details", {})
+            .get("routing", {})
+            .get("last_decision")
+        ),
+        "slot_after": (
+            after["runtime"]
+            .get("backend", {})
+            .get("details", {})
+            .get("slot_router", {})
+            .get("last_decision")
+        ),
+        "continuation_after": continuation_after,
+        "session_restore_after": session_restore_after,
+        "continuation_hit": (
+            None if continuation_after is None else continuation_after.get("continuation_hit")
+        ),
+        "prefix_drift": (
+            None if continuation_after is None else continuation_after.get("prefix_drift")
+        ),
+    }
+
+
+def _run_incremental_long_prefix(
+    *,
+    control_plane_url: str,
+    runtime_url: str,
+    model: str,
+    base_prompt: str,
+    max_tokens: int,
+    conversation_id: str,
+    target_delta_tokens: int,
+) -> Dict[str, Any]:
+    delta = _build_incremental_suffix(
+        runtime_url,
+        base_prompt,
+        target_delta_tokens,
+    )
+    run1 = _run_completion_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        prompt=base_prompt,
+        max_tokens=max_tokens,
+        conversation_id=conversation_id,
+    )
+    run2 = _run_completion_case(
+        control_plane_url=control_plane_url,
+        runtime_url=runtime_url,
+        model=model,
+        prompt=f"{base_prompt}{delta['suffix']}",
+        max_tokens=max_tokens,
+        conversation_id=conversation_id,
+    )
+    run1_prompt_tokens = (run1.get("usage") or {}).get("prompt_tokens")
+    run2_prompt_tokens = (run2.get("usage") or {}).get("prompt_tokens")
+    prompt_tokens_delta = None
+    if isinstance(run1_prompt_tokens, int) and isinstance(run2_prompt_tokens, int):
+        prompt_tokens_delta = run2_prompt_tokens - run1_prompt_tokens
+    speedup = None
+    if run1.get("wall_time_sec") and run2.get("wall_time_sec"):
+        speedup = round(run1["wall_time_sec"] / max(run2["wall_time_sec"], 1e-6), 2)
+    return {
+        "run1": run1,
+        "run2_plus_delta": run2,
+        "delta": {
+            "target_tokens": target_delta_tokens,
+            "actual_delta_tokens": delta.get("actual_delta_tokens"),
+            "prompt_tokens_delta_vs_run1": prompt_tokens_delta,
+            "mode": delta.get("mode"),
+            "fragment": delta.get("fragment"),
+            "token_id": delta.get("token_id"),
+            "suffix_characters": len(delta["suffix"]),
+            "suffix_preview": delta["suffix"][:96],
+        },
+        "summary": {
+            "run1_wall_time_sec": run1.get("wall_time_sec"),
+            "run2_wall_time_sec": run2.get("wall_time_sec"),
+            "run1_prompt_tokens": run1_prompt_tokens,
+            "run2_prompt_tokens": run2_prompt_tokens,
+            "prompt_tokens_delta_vs_run1": prompt_tokens_delta,
+            "run2_cached_prompt_tokens": run2.get("cached_prompt_tokens"),
+            "run2_continuation_hit": run2.get("continuation_hit"),
+            "run2_prefix_drift": run2.get("prefix_drift"),
+            "speedup_x": speedup,
+        },
+    }
+
+
 def _run_single_session_followup(
     *,
     control_plane_url: str,
@@ -550,7 +816,11 @@ def _run_single_session_followup(
     turn1_messages = [
         {
             "role": "user",
-            "content": f"{long_prompt}\n\nExplain in one short sentence why reusing context matters.",
+            "content": (
+                f"{long_prompt}\n\n"
+                "Reply with exactly one character: 1\n"
+                "Do not add any other text."
+            ),
         }
     ]
     turn1 = _run_messages_case(
@@ -558,41 +828,49 @@ def _run_single_session_followup(
         runtime_url=runtime_url,
         model=model,
         messages=turn1_messages,
-        max_tokens=24,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
     )
     turn2_messages = turn1_messages + [
         turn1["assistant"],
-        {"role": "user", "content": "Now answer with exactly one word: benefit?"},
+        {
+            "role": "user",
+            "content": "Reply with exactly one character: 2\nDo not add any other text.",
+        },
     ]
     turn2 = _run_messages_case(
         control_plane_url=control_plane_url,
         runtime_url=runtime_url,
         model=model,
         messages=turn2_messages,
-        max_tokens=8,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
     )
     turn3_messages = turn2_messages + [
         turn2["assistant"],
-        {"role": "user", "content": "Again, one different word only."},
+        {
+            "role": "user",
+            "content": "Reply with exactly one character: 3\nDo not add any other text.",
+        },
     ]
     turn3 = _run_messages_case(
         control_plane_url=control_plane_url,
         runtime_url=runtime_url,
         model=model,
         messages=turn3_messages,
-        max_tokens=8,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
     )
     turn2_prompt_tokens = (turn2.get("usage") or {}).get("prompt_tokens")
     turn3_prompt_tokens = (turn3.get("usage") or {}).get("prompt_tokens")
+    turn2_timings = turn2.get("timings") or {}
+    turn3_timings = turn3.get("timings") or {}
     followup_avg = None
     if turn2.get("wall_time_sec") is not None and turn3.get("wall_time_sec") is not None:
         followup_avg = round((turn2["wall_time_sec"] + turn3["wall_time_sec"]) / 2, 3)
@@ -606,6 +884,10 @@ def _run_single_session_followup(
             "turn3_short_followup_sec": turn3.get("wall_time_sec"),
             "turn2_prompt_tokens": turn2_prompt_tokens,
             "turn3_prompt_tokens": turn3_prompt_tokens,
+            "turn2_prompt_ms": turn2_timings.get("prompt_ms"),
+            "turn3_prompt_ms": turn3_timings.get("prompt_ms"),
+            "turn2_predicted_ms": turn2_timings.get("predicted_ms"),
+            "turn3_predicted_ms": turn3_timings.get("predicted_ms"),
             "turn2_continuation_hit": turn2.get("continuation_hit"),
             "turn3_continuation_hit": turn3.get("continuation_hit"),
             "turn2_prefix_drift": turn2.get("prefix_drift"),
@@ -663,7 +945,8 @@ def _run_single_session_recovery(
             "role": "user",
             "content": (
                 f"{long_prompt}\n\n"
-                "Explain in one short sentence why reusing context matters."
+                "Reply with exactly one character: 1\n"
+                "Do not add any other text."
             ),
         }
     ]
@@ -672,21 +955,24 @@ def _run_single_session_recovery(
         runtime_url=runtime_url,
         model=model,
         messages=turn1_messages,
-        max_tokens=24,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
     )
     turn2_messages = turn1_messages + [
         turn1["assistant"],
-        {"role": "user", "content": "Now answer with exactly one word: benefit?"},
+        {
+            "role": "user",
+            "content": "Reply with exactly one character: 2\nDo not add any other text.",
+        },
     ]
     turn2 = _run_messages_case(
         control_plane_url=control_plane_url,
         runtime_url=runtime_url,
         model=model,
         messages=turn2_messages,
-        max_tokens=8,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
@@ -698,7 +984,10 @@ def _run_single_session_recovery(
         turn2["assistant"],
         {
             "role": "user",
-            "content": "After the short runtime restart, answer with one different word.",
+            "content": (
+                "After the short runtime restart, reply with exactly one character: 3\n"
+                "Do not add any other text."
+            ),
         },
     ]
     turn3 = _run_messages_case(
@@ -706,21 +995,24 @@ def _run_single_session_recovery(
         runtime_url=runtime_url,
         model=model,
         messages=turn3_messages,
-        max_tokens=8,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
     )
     turn4_messages = turn3_messages + [
         turn3["assistant"],
-        {"role": "user", "content": "Again, one different word only."},
+        {
+            "role": "user",
+            "content": "Reply with exactly one character: 4\nDo not add any other text.",
+        },
     ]
     turn4 = _run_messages_case(
         control_plane_url=control_plane_url,
         runtime_url=runtime_url,
         model=model,
         messages=turn4_messages,
-        max_tokens=8,
+        max_tokens=1,
         disable_thinking=disable_thinking,
         llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
         conversation_id=conversation_id,
@@ -731,6 +1023,9 @@ def _run_single_session_recovery(
         if isinstance(turn3_restore, dict)
         else None
     )
+    turn2_timings = turn2.get("timings") or {}
+    turn3_timings = turn3.get("timings") or {}
+    turn4_timings = turn4.get("timings") or {}
     cold_to_restored_speedup = None
     if turn1.get("wall_time_sec") and turn3.get("wall_time_sec"):
         cold_to_restored_speedup = round(
@@ -750,6 +1045,12 @@ def _run_single_session_recovery(
             "turn4_post_restore_followup_sec": turn4.get("wall_time_sec"),
             "turn3_recovery_replay_sec": turn3.get("wall_time_sec"),
             "turn4_post_recovery_followup_sec": turn4.get("wall_time_sec"),
+            "turn2_prompt_ms": turn2_timings.get("prompt_ms"),
+            "turn3_prompt_ms": turn3_timings.get("prompt_ms"),
+            "turn4_prompt_ms": turn4_timings.get("prompt_ms"),
+            "turn2_predicted_ms": turn2_timings.get("predicted_ms"),
+            "turn3_predicted_ms": turn3_timings.get("predicted_ms"),
+            "turn4_predicted_ms": turn4_timings.get("predicted_ms"),
             "turn2_continuation_hit": turn2.get("continuation_hit"),
             "turn3_continuation_hit": turn3.get("continuation_hit"),
             "turn4_continuation_hit": turn4.get("continuation_hit"),
@@ -792,6 +1093,7 @@ def main() -> None:
     parser.add_argument("--long-prefix-repeat", type=int, default=0)
     parser.add_argument("--long-output-max-tokens", type=int, default=192)
     parser.add_argument("--target-context-tokens", type=int, default=65536)
+    parser.add_argument("--incremental-delta-tokens", type=int, default=78)
     parser.add_argument("--prefix-salt", default="")
     parser.add_argument("--disable-thinking", action="store_true", default=True)
     args = parser.parse_args()
@@ -855,6 +1157,18 @@ def main() -> None:
         )
     long_prompt = f"{long_prefix}\n\nReply with exactly OK."
     long_prompt_estimated_tokens = _estimate_prompt_tokens(long_prompt)
+    incremental_prefix_unit = "Incremental suffix probe Jetson AGX Orin"
+    incremental_prefix, incremental_prefix_repeat, incremental_prefix_estimated_tokens = (
+        _build_long_prefix(
+            incremental_prefix_unit,
+            max(
+                1024,
+                effective_context_tokens - max(4096, min(16384, effective_context_tokens // 4)),
+            ),
+        )
+    )
+    incremental_prompt = f"{incremental_prefix}\n\nReply with exactly OK."
+    incremental_prompt_estimated_tokens = _estimate_prompt_tokens(incremental_prompt)
 
     results = {
         "urls": {
@@ -870,6 +1184,10 @@ def main() -> None:
             "long_prefix_repeat": long_prefix_repeat,
             "long_prefix_estimated_tokens": long_prefix_estimated_tokens,
             "long_prompt_estimated_tokens": long_prompt_estimated_tokens,
+            "incremental_prefix_repeat": incremental_prefix_repeat,
+            "incremental_prefix_estimated_tokens": incremental_prefix_estimated_tokens,
+            "incremental_prompt_estimated_tokens": incremental_prompt_estimated_tokens,
+            "incremental_delta_target_tokens": args.incremental_delta_tokens,
         },
         "short_chat": _run_case(
             control_plane_url=args.control_plane_url,
@@ -910,6 +1228,15 @@ def main() -> None:
             disable_thinking=args.disable_thinking,
             llama_cpp_reasoning_compat=llama_cpp_reasoning_compat,
             conversation_id="bench-repeat-long-prefix",
+        ),
+        "long_prefix_incremental": _run_incremental_long_prefix(
+            control_plane_url=args.control_plane_url,
+            runtime_url=args.runtime_url,
+            model=args.model,
+            base_prompt=incremental_prompt,
+            max_tokens=4,
+            conversation_id="bench-incremental-long-prefix",
+            target_delta_tokens=args.incremental_delta_tokens,
         ),
         "multi_turn_chat": _run_messages_case(
             control_plane_url=args.control_plane_url,

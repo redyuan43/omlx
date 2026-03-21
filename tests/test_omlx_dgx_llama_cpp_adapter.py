@@ -86,8 +86,7 @@ def test_llama_cpp_adapter_builds_local_gguf_launch_command(tmp_path: Path):
     assert command[command.index("--ubatch-size") + 1] == "1024"
     assert "--cache-ram" in command
     assert command[command.index("--cache-ram") + 1] == "16384"
-    assert "--cache-reuse" in command
-    assert command[command.index("--cache-reuse") + 1] == "256"
+    assert "--cache-reuse" not in command
     assert "--checkpoint-every-n-tokens" in command
     assert command[command.index("--checkpoint-every-n-tokens") + 1] == "1024"
     assert "--ctx-checkpoints" in command
@@ -108,7 +107,10 @@ def test_llama_cpp_adapter_builds_local_gguf_launch_command(tmp_path: Path):
     assert diagnostics["artifact_summary"]["artifact_kind"] == "local_file"
     assert diagnostics["gguf_variant"] == "Q4_K_M"
     assert diagnostics["batch_size"] == 4096
-    assert diagnostics["cache_reuse"] == 256
+    assert diagnostics["configured_cache_reuse"] == 256
+    assert diagnostics["cache_reuse"] == 0
+    assert diagnostics["cache_reuse_supported"] is False
+    assert "Qwen3.5 uses the hybrid GDN/Mamba-recurrent cache path" in diagnostics["cache_reuse_blocker"]
     assert diagnostics["enable_session_stickiness"] is True
     assert diagnostics["enable_session_restore"] is True
     assert diagnostics["session_restore_min_prompt_tokens"] == 2048
@@ -116,6 +118,30 @@ def test_llama_cpp_adapter_builds_local_gguf_launch_command(tmp_path: Path):
     assert diagnostics["single_session_continuation_enabled"] is False
     assert diagnostics["single_session_continuation_ttl_seconds"] == 600
     assert diagnostics["slot_save_path"].endswith("/runtime/slot_saves")
+
+
+def test_llama_cpp_adapter_keeps_cache_reuse_for_non_qwen35_models(tmp_path: Path):
+    gguf_path = tmp_path / "TinyLlama-1.1B-Chat-v1.0-Q4_K_M.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32120",
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        artifact_path=str(gguf_path),
+        cache_reuse=256,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+
+    command = adapter._build_launch_command()
+    diagnostics = adapter.diagnostics().to_dict()
+
+    assert "--cache-reuse" in command
+    assert command[command.index("--cache-reuse") + 1] == "256"
+    assert diagnostics["configured_cache_reuse"] == 256
+    assert diagnostics["cache_reuse"] == 256
+    assert diagnostics["cache_reuse_supported"] is True
+    assert diagnostics["cache_reuse_blocker"] == ""
 
 
 def test_llama_cpp_adapter_uses_hf_flag_for_remote_gguf_reference(tmp_path: Path):
@@ -771,7 +797,6 @@ def test_llama_cpp_adapter_single_slot_followup_keeps_last_turn_anchor(tmp_path:
     metrics = adapter.collect_metrics().to_dict()
 
     assert third_payload["messages"] == [
-        {"role": "user", "content": "benefit?"},
         {"role": "assistant", "content": "turn2"},
         {"role": "user", "content": "again"},
     ]
@@ -904,6 +929,84 @@ def test_llama_cpp_adapter_preserves_explicit_reasoning_override(tmp_path: Path)
     assert request_payload["reasoning_budget"] == -1
     assert request_payload["enableThinking"] is False
     assert request_payload["reasoning"] is False
+
+
+def test_llama_cpp_adapter_strips_disabled_thinking_tags_and_preserves_continuation(
+    tmp_path: Path,
+):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_M.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32121",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+        enable_session_restore=False,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            response_text = "<think>\n\n</think>\n\nAnswer"
+            if len([call for call in calls if call[1] == "v1/chat/completions"]) > 1:
+                response_text = "<think>\n\n</think>\n\nBenefit"
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": response_text}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    first_response = adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "ping"}],
+            "metadata": {"conversation_id": "session-a"},
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+    assert first_response.json()["choices"][0]["message"]["content"] == "Answer"
+
+    second_response = adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [
+                {"role": "user", "content": "ping"},
+                {"role": "assistant", "content": "Answer"},
+                {"role": "user", "content": "benefit?"},
+            ],
+            "metadata": {"conversation_id": "session-a"},
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+    )
+    assert second_response.json()["choices"][0]["message"]["content"] == "Benefit"
+
+    request_calls = [call for call in calls if call[1] == "v1/chat/completions"]
+    assert request_calls[1][2]["json"]["messages"] == [
+        {"role": "assistant", "content": "Answer"},
+        {"role": "user", "content": "benefit?"},
+    ]
+
+    metrics = adapter.collect_metrics().to_dict()
+    assert metrics["details"]["continuation"]["last_decision"]["reason"] == "hit"
+    assert metrics["details"]["continuation"]["last_decision"]["continuation_hit"] is True
 
 
 def test_llama_cpp_adapter_leaves_short_or_unkeyed_requests_unassigned(tmp_path: Path):
@@ -1299,14 +1402,15 @@ def test_llama_cpp_adapter_restores_single_slot_continuation_after_adapter_resta
 
     assert summary_before["restored_from_disk"] is True
     assert summary_before["recovery_pending"] is False
-    assert any(call[1] == "slots/0?action=save" for call in calls)
+    assert not any(call[1] == "slots/0?action=save" for call in calls)
     assert request_payload["messages"] == [
         {"role": "assistant", "content": "OK"},
         {"role": "user", "content": "benefit?"},
     ]
     assert metrics["details"]["continuation"]["last_decision"]["reason"] == "hit"
+    assert metrics["details"]["continuation"]["durable_state_dirty"] is True
     assert session_restore["stats"]["snapshots"] == 1
-    assert session_restore["last_save"]["ok"] is True
+    assert session_restore["last_save"] is None
     assert session_restore["last_restore"] is None
 
 
@@ -1458,7 +1562,6 @@ def test_llama_cpp_adapter_restores_saved_slot_after_runtime_restart(
         {"role": "user", "content": "benefit?"},
     ]
     assert request_payloads[1]["messages"] == [
-        {"role": "user", "content": "benefit?"},
         {"role": "assistant", "content": "turn2"},
         {"role": "user", "content": "again"},
     ]
@@ -1586,6 +1689,88 @@ def test_llama_cpp_adapter_falls_back_to_cold_replay_when_slot_restore_fails(
     assert continuation["last_decision"]["reason"] == "recovery_replay"
     assert session_restore["last_restore"]["ok"] is False
     assert session_restore["counts"]["restore_fallback"] == 1
+
+
+def test_llama_cpp_adapter_defers_short_followup_slot_save_until_stop(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_M.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32120",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+        sticky_session_prompt_threshold=2048,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    save_calls = []
+    long_prefix = "prefix " * 4096
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path == "slots/0?action=save":
+            save_calls.append(kwargs["json"]["filename"])
+            (adapter._slot_save_path / kwargs["json"]["filename"]).write_bytes(b"slot-save")
+            return FakeResponse(
+                json_data={
+                    "id_slot": 0,
+                    "filename": kwargs["json"]["filename"],
+                    "n_saved": 42,
+                    "n_written": 1234,
+                    "timings": {"save_ms": 12.5},
+                },
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "1"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+    adapter.process_manager.stop = lambda: {"ok": True, "reason": "stopped"}  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": long_prefix}],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [
+                {"role": "user", "content": long_prefix},
+                {"role": "assistant", "content": "1"},
+                {"role": "user", "content": "2"},
+            ],
+            "metadata": {"conversation_id": "session-a"},
+        },
+    )
+
+    continuation_before = adapter.collect_metrics().to_dict()["details"]["continuation"]
+    assert len(save_calls) == 1
+    assert continuation_before["durable_state_dirty"] is True
+
+    adapter.stop_runtime()
+
+    continuation_after = adapter.collect_metrics().to_dict()["details"]["continuation"]
+    assert len(save_calls) == 2
+    assert continuation_after["durable_state_dirty"] is False
 
 
 def test_llama_cpp_adapter_restores_sticky_bindings_after_adapter_restart(

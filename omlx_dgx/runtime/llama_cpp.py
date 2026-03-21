@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 from urllib.parse import urlparse
 
+from omlx.api.thinking import extract_thinking
 from omlx_dgx.config import (
     BackendConfig,
     DGXRuntimeConfig,
@@ -51,6 +52,12 @@ _RECYCLE_OWNED_IDLE_SLOT_MIN_AGE_SECONDS = 1.0
 _SINGLE_SLOT_CONTINUATION_TTL_SECONDS = 600.0
 _PERSISTED_RUNTIME_STATE_VERSION = 1
 _SESSION_RESTORE_RECENT_LIMIT = 16
+_CACHE_REUSE_UNSUPPORTED_TOKENS = (
+    "qwen3.5",
+    "qwen35",
+    "qwen3_5",
+    "qwen3-5",
+)
 
 
 def _coerce_response_payload(response) -> Dict[str, Any]:
@@ -164,6 +171,19 @@ def _canonical_message(message: Any) -> str:
     return str(message)
 
 
+def _canonical_message_role(message: Any) -> str:
+    if isinstance(message, dict):
+        return str(message.get("role", "") or "")
+    if isinstance(message, str):
+        try:
+            payload = json.loads(message)
+        except Exception:
+            return ""
+        if isinstance(payload, dict):
+            return str(payload.get("role", "") or "")
+    return ""
+
+
 def _response_assistant_message(response_payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     choices = response_payload.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -250,6 +270,33 @@ def _binary_exists(binary: str) -> bool:
     return shutil.which(binary) is not None
 
 
+def _cache_reuse_model_blocker(*model_refs: str) -> str:
+    normalized = " ".join(str(model_ref or "").lower() for model_ref in model_refs if model_ref)
+    if any(token in normalized for token in _CACHE_REUSE_UNSUPPORTED_TOKENS):
+        return (
+            "Qwen3.5 uses the hybrid GDN/Mamba-recurrent cache path; "
+            "llama.cpp cache_reuse is not supported"
+        )
+    return ""
+
+
+def _cache_reuse_runtime_blocker(log_lines: List[str]) -> str:
+    for line in log_lines:
+        lowered = line.lower()
+        if "cache_reuse is not supported" in lowered or "cache reuse is not supported" in lowered:
+            return "llama.cpp reported this runtime context does not support cache_reuse"
+    return ""
+
+
+def _strip_thinking_content(text: str) -> str:
+    thinking, regular = extract_thinking(text)
+    if thinking:
+        return regular.strip()
+    if "<think>" in text and "</think>" in text:
+        return regular.strip()
+    return text
+
+
 @dataclass
 class LlamaCppDiagnostics:
     adapter: str
@@ -273,7 +320,10 @@ class LlamaCppDiagnostics:
     batch_size: int
     ubatch_size: int
     cache_ram_mib: int
+    configured_cache_reuse: int
     cache_reuse: int
+    cache_reuse_supported: bool
+    cache_reuse_blocker: str
     checkpoint_every_n_tokens: int
     ctx_checkpoints: int
     slot_prompt_similarity: float
@@ -486,6 +536,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._recent_slot_decisions: Deque[SlotRouteDecision] = deque(maxlen=32)
         self._last_slot_decision: Optional[SlotRouteDecision] = None
         self._single_slot_continuation: Optional[ContinuationState] = None
+        self._single_slot_continuation_dirty = False
         self._single_slot_recovery_pending = False
         self._single_slot_restored_from_disk = False
         self._recent_continuation_decisions: Deque[ContinuationDecision] = deque(maxlen=32)
@@ -557,6 +608,36 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             self.config.model_repo_id,
         )
 
+    def _cache_reuse_model_blocker(self) -> str:
+        return _cache_reuse_model_blocker(
+            self._effective_model_path(),
+        )
+
+    def _cache_reuse_runtime_blocker(self) -> str:
+        if not self.process_manager.log_path.exists():
+            return ""
+        try:
+            log_lines = self.process_manager.logs(lines=160)["lines"]
+        except Exception:
+            return ""
+        return _cache_reuse_runtime_blocker(log_lines)
+
+    def _effective_cache_reuse(self) -> int:
+        configured = max(0, int(self.config.cache_reuse or 0))
+        if configured <= 0:
+            return 0
+        if self._cache_reuse_model_blocker():
+            return 0
+        if self._cache_reuse_runtime_blocker():
+            return 0
+        return configured
+
+    def _cache_reuse_blocker(self) -> str:
+        model_blocker = self._cache_reuse_model_blocker()
+        if model_blocker:
+            return model_blocker
+        return self._cache_reuse_runtime_blocker()
+
     def _model_flag(self, model_path: str) -> str:
         candidate = Path(model_path).expanduser()
         if candidate.exists():
@@ -603,8 +684,9 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             self.config.split_mode,
         ]
         args.extend(["--flash-attn", "on" if self.config.flash_attn else "off"])
-        if self.config.cache_reuse > 0:
-            args.extend(["--cache-reuse", str(self.config.cache_reuse)])
+        effective_cache_reuse = self._effective_cache_reuse()
+        if effective_cache_reuse > 0:
+            args.extend(["--cache-reuse", str(effective_cache_reuse)])
         if self.config.enable_runtime_metrics:
             args.append("--metrics")
         model_capabilities = infer_model_capabilities(
@@ -632,6 +714,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         except BackendError as exc:
             launcher_cmd_error = str(exc)
         gguf_variant = self._gguf_variant()
+        cache_reuse_blocker = self._cache_reuse_blocker()
+        effective_cache_reuse = self._effective_cache_reuse()
         model_capabilities = infer_model_capabilities(
             self.config.artifact_path,
             self.config.model_repo_id,
@@ -662,7 +746,10 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             batch_size=self.config.batch_size,
             ubatch_size=self.config.ubatch_size,
             cache_ram_mib=self.config.cache_ram_mib,
-            cache_reuse=self.config.cache_reuse,
+            configured_cache_reuse=self.config.cache_reuse,
+            cache_reuse=effective_cache_reuse,
+            cache_reuse_supported=not bool(cache_reuse_blocker),
+            cache_reuse_blocker=cache_reuse_blocker,
             checkpoint_every_n_tokens=self.config.checkpoint_every_n_tokens,
             ctx_checkpoints=self.config.ctx_checkpoints,
             slot_prompt_similarity=self.config.slot_prompt_similarity,
@@ -866,13 +953,13 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
     def _persist_session_snapshot(
         self,
         state: ContinuationState,
-    ) -> None:
+    ) -> bool:
         if not self._should_persist_session_snapshot(
             conversation_id=state.conversation_id,
             model_id=state.model_id,
             estimated_prompt_tokens=state.estimated_prompt_tokens,
         ):
-            return
+            return False
 
         existing = self._session_restore_store.get(
             conversation_id=state.conversation_id,
@@ -907,7 +994,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     "error": str(exc),
                     "timestamp": round(time.time(), 3),
                 }
-            return
+            return False
 
         timings = result.get("timings", {})
         snapshot = SessionRestoreSnapshot(
@@ -953,6 +1040,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 "n_written": result.get("n_written"),
                 "timestamp": round(time.time(), 3),
             }
+        return True
 
     def _try_restore_session_snapshot(
         self,
@@ -1060,6 +1148,19 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         return True
 
     def _persist_runtime_state_locked(self) -> None:
+        single_slot_state = self._single_slot_continuation
+        if single_slot_state is not None and self._single_slot_continuation_dirty:
+            durable_snapshot = self._session_restore_store.get(
+                conversation_id=single_slot_state.conversation_id,
+                model_id=single_slot_state.model_id,
+                touch=False,
+            )
+            if isinstance(getattr(durable_snapshot, "state_payload", None), dict):
+                restored_state = self._deserialize_continuation_state(
+                    durable_snapshot.state_payload
+                )
+                if restored_state is not None:
+                    single_slot_state = restored_state
         bindings = []
         for session_key, binding in self._session_bindings.items():
             bindings.append(
@@ -1075,8 +1176,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "single_slot_recovery_pending": self._single_slot_recovery_pending,
             "single_slot_continuation": (
                 None
-                if self._single_slot_continuation is None
-                else self._serialize_continuation_state(self._single_slot_continuation)
+                if single_slot_state is None
+                else self._serialize_continuation_state(single_slot_state)
             ),
             "session_bindings": bindings,
         }
@@ -1110,6 +1211,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             state = self._deserialize_continuation_state(continuation_payload)
             if state is not None:
                 self._single_slot_continuation = state
+                self._single_slot_continuation_dirty = False
                 self._single_slot_restored_from_disk = True
                 self._single_slot_recovery_pending = not signature_matches
 
@@ -1232,12 +1334,14 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             counts = dict(self._continuation_counts)
             recovery_pending = self._single_slot_recovery_pending
             restored_from_disk = self._single_slot_restored_from_disk
+            durable_state_dirty = self._single_slot_continuation_dirty
             runtime_signature = self._runtime_state_signature
         return {
             "enabled": self.config.enable_session_stickiness and self.config.parallel_slots <= 1,
             "ttl_seconds": int(_SINGLE_SLOT_CONTINUATION_TTL_SECONDS),
             "recovery_pending": recovery_pending,
             "restored_from_disk": restored_from_disk,
+            "durable_state_dirty": durable_state_dirty,
             "state_path": str(self._runtime_state_path),
             "runtime_signature": runtime_signature,
             "state": state,
@@ -1284,16 +1388,20 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         path: str,
         payload: Dict[str, Any],
         response_payload: Optional[Dict[str, Any]],
-    ) -> None:
+    ) -> bool:
         if path not in {"v1/chat/completions", "v1/completions"}:
-            return
+            return False
         conversation_id = _extract_routing_key(payload)
         slot_id = payload.get("id_slot")
         if not conversation_id or not isinstance(slot_id, int):
-            return
+            return False
         if payload.get("cache_prompt") is False:
-            return
+            return False
         estimated_prompt_tokens = _estimate_prompt_tokens(payload)
+        effective_prompt_tokens = estimated_prompt_tokens
+        raw_effective_prompt_tokens = payload.get("_omlx_effective_prompt_tokens")
+        if isinstance(raw_effective_prompt_tokens, (int, float)):
+            effective_prompt_tokens = max(0, int(raw_effective_prompt_tokens))
         next_state = self._build_continuation_state(
             path,
             payload,
@@ -1301,6 +1409,17 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             estimated_prompt_tokens,
         )
         next_state.slot_id = slot_id
+        if (
+            self.config.parallel_slots <= 1
+            and effective_prompt_tokens < self.config.sticky_session_prompt_threshold
+            and self._session_restore_store.get(
+                conversation_id=conversation_id,
+                model_id=next_state.model_id,
+                touch=False,
+            )
+            is not None
+        ):
+            return False
         if (
             path == "v1/chat/completions"
             and next_state.prompt_mode == "messages"
@@ -1313,7 +1432,41 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     _canonical_message(assistant_message),
                 )
                 next_state.slot_message_count = next_state.message_count + 1
-        self._persist_session_snapshot(next_state)
+        return self._persist_session_snapshot(next_state)
+
+    def _flush_dirty_single_slot_snapshot(self) -> None:
+        with self._lock:
+            state = self._single_slot_continuation
+            dirty = self._single_slot_continuation_dirty
+        if not dirty or state is None:
+            return
+        fingerprint = (
+            state.conversation_id,
+            state.model_id,
+            state.prefix_digest,
+            state.request_shape_digest,
+            state.slot_message_count,
+        )
+        if not self._persist_session_snapshot(state):
+            return
+        with self._lock:
+            current = self._single_slot_continuation
+            if current is None:
+                return
+            current_fingerprint = (
+                current.conversation_id,
+                current.model_id,
+                current.prefix_digest,
+                current.request_shape_digest,
+                current.slot_message_count,
+            )
+            if current_fingerprint != fingerprint:
+                return
+            self._single_slot_continuation_dirty = False
+            current_signature = self._current_runtime_signature()
+            if current_signature:
+                self._runtime_state_signature = current_signature
+            self._persist_runtime_state_locked()
 
     def _build_continuation_state(
         self,
@@ -1521,7 +1674,13 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             ):
                 suffix_messages = messages[slot_message_count:]
                 if suffix_messages:
-                    anchor_count = 1 if slot_message_count <= 2 else 2
+                    anchor_count = 1
+                    if slot_message_count > 0 and len(slot_prompt_value) >= slot_message_count:
+                        last_slot_role = _canonical_message_role(
+                            slot_prompt_value[slot_message_count - 1]
+                        )
+                        if last_slot_role != "assistant":
+                            anchor_count = 1 if slot_message_count <= 2 else 2
                     start_index = max(0, slot_message_count - anchor_count)
                     prepared["messages"] = messages[start_index:]
                     suffix_only = True
@@ -1546,7 +1705,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
     ) -> None:
         if path not in {"v1/chat/completions", "v1/completions"} or not response_ok:
             return
-        self._persist_session_snapshot_from_payload(
+        persisted_snapshot = self._persist_session_snapshot_from_payload(
             path=path,
             payload=payload,
             response_payload=response_payload,
@@ -1578,9 +1737,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         with self._lock:
             self._runtime_state_signature = self._current_runtime_signature()
             self._single_slot_continuation = next_state
+            self._single_slot_continuation_dirty = not persisted_snapshot
             self._single_slot_recovery_pending = False
             self._single_slot_restored_from_disk = False
-            self._persist_runtime_state_locked()
+            if persisted_snapshot:
+                self._persist_runtime_state_locked()
 
     def _record_slot_decision(self, decision: SlotRouteDecision) -> None:
         with self._lock:
@@ -1944,6 +2105,57 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         )
         return prepared
 
+    def _sanitize_disable_thinking_response(
+        self,
+        *,
+        path: str,
+        request_payload: Dict[str, Any],
+        response_payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if path not in {"v1/chat/completions", "v1/completions"}:
+            return response_payload
+        if not _disable_thinking_requested(request_payload):
+            return response_payload
+
+        sanitized = deepcopy(response_payload)
+        choices = sanitized.get("choices")
+        if not isinstance(choices, list):
+            return sanitized
+
+        for choice in choices:
+            if not isinstance(choice, dict):
+                continue
+            if path == "v1/chat/completions":
+                message = choice.get("message")
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if isinstance(content, str):
+                    message["content"] = _strip_thinking_content(content)
+            else:
+                content = choice.get("text")
+                if isinstance(content, str):
+                    choice["text"] = _strip_thinking_content(content)
+        return sanitized
+
+    def _rewrite_json_response(
+        self,
+        response: Any,
+        payload: Dict[str, Any],
+    ) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        if hasattr(response, "_json_data"):
+            response._json_data = payload
+        if hasattr(response, "_content"):
+            response._content = encoded
+        try:
+            response.text = encoded.decode("utf-8")
+        except Exception:
+            pass
+        headers = getattr(response, "headers", None)
+        if isinstance(headers, dict):
+            headers["content-length"] = str(len(encoded))
+
     def _request_optional_json(self, path: str, *, timeout: float = 10.0) -> Dict[str, Any]:
         try:
             response = self._request("GET", path, timeout=timeout)
@@ -2021,6 +2233,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             state_payload = deepcopy(payload)
             prepared = self._prepare_proxy_payload(path, payload)
             kwargs["json"] = prepared
+            state_payload["_omlx_effective_prompt_tokens"] = _estimate_prompt_tokens(prepared)
             for key in (
                 "cache_prompt",
                 "id_slot",
@@ -2051,6 +2264,13 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             if response.ok and "application/json" in content_type:
                 try:
                     response_payload = response.json()
+                    if isinstance(response_payload, dict):
+                        response_payload = self._sanitize_disable_thinking_response(
+                            path=path,
+                            request_payload=prepared,
+                            response_payload=response_payload,
+                        )
+                        self._rewrite_json_response(response, response_payload)
                 except Exception:
                     response_payload = None
             elif path in {"v1/chat/completions", "v1/completions"}:
@@ -2086,6 +2306,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         return {**result, "mode": "llama_cpp"}
 
     def stop_runtime(self) -> Dict[str, Any]:
+        self._flush_dirty_single_slot_snapshot()
         result = self.process_manager.stop()
         with self._lock:
             if self._single_slot_continuation is not None:
