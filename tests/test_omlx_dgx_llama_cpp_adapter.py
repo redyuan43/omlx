@@ -989,6 +989,204 @@ def test_llama_cpp_adapter_restores_shared_prefix_for_new_conversation(tmp_path:
     assert cold_cache["last_hit"]["ok"] is True
 
 
+def test_llama_cpp_adapter_saves_and_restores_named_context(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32118",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+        session_restore_min_prompt_tokens=0,
+        sticky_session_prompt_threshold=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+    replies = iter(["turn1", "turn2"])
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "slots/0?action=save":
+            (adapter._slot_save_path / kwargs["json"]["filename"]).write_bytes(b"slot-save")
+            return FakeResponse(
+                json_data={
+                    "id_slot": 0,
+                    "filename": kwargs["json"]["filename"],
+                    "n_saved": 192,
+                    "n_written": 7168,
+                    "timings": {"save_ms": 6.0},
+                },
+                headers={"content-type": "application/json"},
+            )
+        if path == "slots/0?action=restore":
+            return FakeResponse(
+                json_data={
+                    "id_slot": 0,
+                    "filename": kwargs["json"]["filename"],
+                    "n_restored": 192,
+                    "n_read": 7168,
+                    "timings": {"restore_ms": 4.25},
+                },
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [
+                        {"message": {"role": "assistant", "content": next(replies)}}
+                    ],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+    prefix = {"role": "user", "content": "prefix " * 128}
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [prefix],
+            "metadata": {"context_id": "ctx-a"},
+        },
+    )
+
+    named_contexts = adapter.list_named_contexts()
+    assert named_contexts["stats"]["snapshots"] == 1
+    assert named_contexts["contexts"][0]["context_id"] == "ctx-a"
+
+    with adapter._lock:
+        adapter._single_slot_continuation = None
+        adapter._single_slot_continuation_dirty = False
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [
+                prefix,
+                {"role": "assistant", "content": "turn1"},
+                {"role": "user", "content": "benefit?"},
+            ],
+            "metadata": {"context_id": "ctx-a"},
+        },
+    )
+
+    request_payloads = [call[2]["json"] for call in calls if call[1] == "v1/chat/completions"]
+    metrics = adapter.collect_metrics().to_dict()
+    continuation = metrics["details"]["continuation"]
+    named_context_summary = metrics["details"]["named_contexts"]
+
+    assert any(call[1] == "slots/0?action=restore" for call in calls)
+    assert request_payloads[1]["messages"] == [
+        {"role": "assistant", "content": "turn1"},
+        {"role": "user", "content": "benefit?"},
+    ]
+    assert continuation["last_decision"]["reason"] == "named_context_hit"
+    assert continuation["last_decision"]["continuation_hit"] is True
+    assert continuation["last_decision"]["suffix_only"] is True
+    assert named_context_summary["counts"]["saved"] >= 1
+    assert named_context_summary["counts"]["restored"] == 1
+    assert named_context_summary["last_restore"]["ok"] is True
+
+
+def test_llama_cpp_adapter_deletes_named_context_slot_save(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32118",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+        session_restore_min_prompt_tokens=0,
+        sticky_session_prompt_threshold=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "slots/0?action=save":
+            (adapter._slot_save_path / kwargs["json"]["filename"]).write_bytes(b"slot-save")
+            return FakeResponse(
+                json_data={
+                    "id_slot": 0,
+                    "filename": kwargs["json"]["filename"],
+                    "n_saved": 96,
+                    "n_written": 3072,
+                    "timings": {"save_ms": 3.5},
+                },
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "turn1"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "prefix " * 64}],
+            "metadata": {"context_id": "ctx-a"},
+        },
+    )
+
+    named_context = adapter.get_named_context("ctx-a")
+    slot_save_file = adapter._slot_save_path / named_context["save_filename"]
+    assert slot_save_file.exists()
+
+    deleted = adapter.delete_named_context("ctx-a")
+    named_contexts = adapter.list_named_contexts()
+
+    assert deleted["deleted"] is True
+    assert not slot_save_file.exists()
+    assert named_contexts["stats"]["snapshots"] == 0
+    assert named_contexts["counts"]["deleted"] == 1
+
+
 def test_llama_cpp_adapter_single_slot_followup_keeps_last_turn_anchor(tmp_path: Path):
     gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_S.gguf"
     gguf_path.write_bytes(b"GGUF")

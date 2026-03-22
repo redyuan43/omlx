@@ -110,6 +110,18 @@ def _model_pool_backend(backend: BackendAdapter):
     return None
 
 
+def _named_context_backend(backend: BackendAdapter):
+    required = (
+        "list_named_contexts",
+        "get_named_context",
+        "delete_named_context",
+        "restore_named_context",
+    )
+    if all(callable(getattr(backend, name, None)) for name in required):
+        return backend
+    return None
+
+
 def _parse_model_pool_registration(
     body: dict,
     settings: DGXSettingsManager,
@@ -961,6 +973,15 @@ def create_app(
         pool_backend = _model_pool_backend(services.backend)
         if pool_backend is not None:
             payload["model_pool"] = pool_backend.model_pool_diagnostics()
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is not None:
+            try:
+                if pool_backend is not None:
+                    payload["named_contexts"] = context_backend.list_named_contexts()
+                else:
+                    payload["named_contexts"] = context_backend.list_named_contexts()
+            except BackendError as exc:
+                payload["named_contexts_error"] = str(exc)
         return payload
 
     @app.get("/admin/api/runtime/capabilities")
@@ -1036,6 +1057,58 @@ def create_app(
         services.settings.save()
         try:
             return pool_backend.set_model_pin(model_id, pinned)
+        except BackendError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/contexts")
+    async def admin_list_contexts(model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.list_named_contexts(model_id=model)
+            return context_backend.list_named_contexts()
+        except BackendError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/contexts/{context_id}")
+    async def admin_get_context(context_id: str, model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.get_named_context(context_id, model_id=model)
+            return context_backend.get_named_context(context_id)
+        except BackendError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/admin/api/contexts/{context_id}")
+    async def admin_delete_context(context_id: str, model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.delete_named_context(context_id, model_id=model)
+            return context_backend.delete_named_context(context_id)
+        except BackendError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/admin/api/contexts/{context_id}/restore")
+    async def admin_restore_context(context_id: str, model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.restore_named_context(context_id, model_id=model)
+            return context_backend.restore_named_context(context_id)
         except BackendError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

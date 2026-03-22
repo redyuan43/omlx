@@ -54,6 +54,7 @@ _SINGLE_SLOT_CONTINUATION_TTL_SECONDS = 600.0
 _PERSISTED_RUNTIME_STATE_VERSION = 1
 _SESSION_RESTORE_RECENT_LIMIT = 16
 _COLD_CACHE_RECENT_LIMIT = 16
+_NAMED_CONTEXT_RECENT_LIMIT = 20
 _CACHE_REUSE_UNSUPPORTED_TOKENS = (
     "qwen3.5",
     "qwen35",
@@ -131,6 +132,20 @@ def _extract_routing_key(payload: Dict[str, Any]) -> Optional[str]:
     if payload.get("user"):
         return str(payload["user"])
     return None
+
+
+def _extract_context_id(payload: Dict[str, Any]) -> Optional[str]:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    value = metadata.get("context_id")
+    if not value:
+        return None
+    return str(value)
+
+
+def _extract_single_slot_key(payload: Dict[str, Any]) -> Optional[str]:
+    return _extract_routing_key(payload) or _extract_context_id(payload)
 
 
 def _hash_key(value: str) -> str:
@@ -552,6 +567,9 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._session_restore_store = SessionRestoreStore(
             self.state_dir / "runtime" / "session_restore"
         )
+        self._named_context_store = SessionRestoreStore(
+            self.state_dir / "runtime" / "context_store"
+        )
         parsed = urlparse(config.base_url)
         self.launch_host = parsed.hostname or "127.0.0.1"
         self.launch_port = parsed.port or 30000
@@ -585,11 +603,23 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "restore_error": 0,
         }
         self._last_cold_cache_hit: Optional[Dict[str, Any]] = None
+        self._named_context_counts: Dict[str, int] = {
+            "saved": 0,
+            "restored": 0,
+            "restore_miss": 0,
+            "save_error": 0,
+            "restore_error": 0,
+            "deleted": 0,
+            "evicted": 0,
+        }
+        self._last_named_context_save: Optional[Dict[str, Any]] = None
+        self._last_named_context_restore: Optional[Dict[str, Any]] = None
         self._continuation_counts: Dict[str, int] = {
             "disabled": 0,
             "no_conversation_id": 0,
             "cold_start": 0,
             "hit": 0,
+            "named_context_hit": 0,
             "cold_cache_hit": 0,
             "shared_prefix_hit": 0,
             "recovery_replay": 0,
@@ -614,6 +644,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "unkeyed_recycled_slot": 0,
             "single_slot_cold_start": 0,
             "single_slot_hit": 0,
+            "single_slot_named_context_hit": 0,
             "single_slot_cold_cache_hit": 0,
             "single_slot_shared_prefix_hit": 0,
             "single_slot_recovery_replay": 0,
@@ -979,12 +1010,17 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         slot_id: int,
         source: str,
     ) -> bool:
+        store = (
+            self._named_context_store
+            if source == "context"
+            else self._session_restore_store
+        )
         slot_save_file = self._slot_save_path / snapshot.save_filename
         if not slot_save_file.exists():
             snapshot.last_restore_at = time.time()
             snapshot.last_restore_status = "missing_slot_save_file"
             snapshot.last_restore_error = str(slot_save_file)
-            self._session_restore_store.put(snapshot)
+            store.put(snapshot)
             with self._lock:
                 if source == "session_restore":
                     self._session_restore_counts["restore_error"] = (
@@ -993,6 +1029,19 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     self._last_slot_restore = {
                         "ok": False,
                         "conversation_key_hash": _hash_key(conversation_id),
+                        "slot_id": slot_id,
+                        "filename": snapshot.save_filename,
+                        "status": snapshot.last_restore_status,
+                        "error": snapshot.last_restore_error,
+                        "timestamp": round(time.time(), 3),
+                    }
+                elif source == "context":
+                    self._named_context_counts["restore_error"] = (
+                        self._named_context_counts.get("restore_error", 0) + 1
+                    )
+                    self._last_named_context_restore = {
+                        "ok": False,
+                        "context_id": conversation_id,
                         "slot_id": slot_id,
                         "filename": snapshot.save_filename,
                         "status": snapshot.last_restore_status,
@@ -1028,7 +1077,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             snapshot.last_restore_at = time.time()
             snapshot.last_restore_status = "restore_error"
             snapshot.last_restore_error = str(exc)
-            self._session_restore_store.put(snapshot)
+            store.put(snapshot)
             with self._lock:
                 if source == "session_restore":
                     self._session_restore_counts["restore_error"] = (
@@ -1037,6 +1086,19 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     self._last_slot_restore = {
                         "ok": False,
                         "conversation_key_hash": _hash_key(conversation_id),
+                        "slot_id": slot_id,
+                        "filename": snapshot.save_filename,
+                        "status": snapshot.last_restore_status,
+                        "error": snapshot.last_restore_error,
+                        "timestamp": round(time.time(), 3),
+                    }
+                elif source == "context":
+                    self._named_context_counts["restore_error"] = (
+                        self._named_context_counts.get("restore_error", 0) + 1
+                    )
+                    self._last_named_context_restore = {
+                        "ok": False,
+                        "context_id": conversation_id,
                         "slot_id": slot_id,
                         "filename": snapshot.save_filename,
                         "status": snapshot.last_restore_status,
@@ -1073,7 +1135,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         snapshot.last_restore_status = "restored"
         snapshot.last_restore_error = ""
         snapshot.runtime_signature = self._runtime_state_signature
-        self._session_restore_store.put(snapshot)
+        store.put(snapshot)
         with self._lock:
             if source == "session_restore":
                 self._session_restore_counts["restored"] = (
@@ -1082,6 +1144,21 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 self._last_slot_restore = {
                     "ok": True,
                     "conversation_key_hash": _hash_key(conversation_id),
+                    "slot_id": slot_id,
+                    "filename": snapshot.save_filename,
+                    "restore_ms": timings.get("restore_ms"),
+                    "n_restored": result.get("n_restored"),
+                    "n_read": result.get("n_read"),
+                    "status": snapshot.last_restore_status,
+                    "timestamp": round(time.time(), 3),
+                }
+            elif source == "context":
+                self._named_context_counts["restored"] = (
+                    self._named_context_counts.get("restored", 0) + 1
+                )
+                self._last_named_context_restore = {
+                    "ok": True,
+                    "context_id": conversation_id,
                     "slot_id": slot_id,
                     "filename": snapshot.save_filename,
                     "restore_ms": timings.get("restore_ms"),
@@ -1609,6 +1686,279 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "entries": entries,
         }
 
+    def _named_context_public_dict(
+        self,
+        snapshot: SessionRestoreSnapshot,
+    ) -> Dict[str, Any]:
+        payload = snapshot.to_public_dict()
+        payload["context_id"] = snapshot.conversation_id
+        payload["slot_save_exists"] = self._snapshot_slot_save_exists(snapshot)
+        return payload
+
+    def _named_context_summary(self) -> Dict[str, Any]:
+        snapshots = self._named_context_store.list_snapshots(limit=_NAMED_CONTEXT_RECENT_LIMIT)
+        with self._lock:
+            counts = dict(self._named_context_counts)
+            last_save = (
+                None if self._last_named_context_save is None else dict(self._last_named_context_save)
+            )
+            last_restore = (
+                None
+                if self._last_named_context_restore is None
+                else dict(self._last_named_context_restore)
+            )
+        stats = self._named_context_store.stats()
+        return {
+            "enabled": True,
+            "stats": stats,
+            "counts": counts,
+            "last_save": last_save,
+            "last_restore": last_restore,
+            "contexts": [self._named_context_public_dict(snapshot) for snapshot in snapshots],
+        }
+
+    def list_named_contexts(self) -> Dict[str, Any]:
+        return self._named_context_summary()
+
+    def _get_named_context_snapshot(
+        self,
+        context_id: str,
+    ) -> Optional[SessionRestoreSnapshot]:
+        for snapshot in self._named_context_store.list_snapshots(limit=256):
+            if snapshot.conversation_id == context_id:
+                return snapshot
+        return None
+
+    def get_named_context(self, context_id: str) -> Dict[str, Any]:
+        snapshot = self._get_named_context_snapshot(context_id)
+        if snapshot is None:
+            raise BackendError(f"unknown named context: {context_id}")
+        return self._named_context_public_dict(snapshot)
+
+    def delete_named_context(self, context_id: str) -> Dict[str, Any]:
+        snapshot = self._get_named_context_snapshot(context_id)
+        if snapshot is None:
+            raise BackendError(f"unknown named context: {context_id}")
+        slot_save_file = self._slot_save_path / snapshot.save_filename
+        if slot_save_file.exists():
+            slot_save_file.unlink()
+        self._named_context_store.delete(
+            conversation_id=context_id,
+            model_id=snapshot.model_id,
+        )
+        with self._lock:
+            self._named_context_counts["deleted"] = (
+                self._named_context_counts.get("deleted", 0) + 1
+            )
+        return {
+            "deleted": True,
+            "context_id": context_id,
+        }
+
+    def restore_named_context(self, context_id: str) -> Dict[str, Any]:
+        snapshot = self._get_named_context_snapshot(context_id)
+        if snapshot is None:
+            with self._lock:
+                self._named_context_counts["restore_miss"] = (
+                    self._named_context_counts.get("restore_miss", 0) + 1
+                )
+            raise BackendError(f"unknown named context: {context_id}")
+        if not self._restore_snapshot(
+            snapshot,
+            conversation_id=context_id,
+            slot_id=0,
+            source="context",
+        ):
+            raise BackendError(f"failed to restore named context: {context_id}")
+        restored_state = self._snapshot_state(snapshot)
+        if restored_state is not None:
+            with self._lock:
+                self._single_slot_continuation = restored_state
+                self._single_slot_continuation_dirty = False
+                self._single_slot_recovery_pending = False
+                self._single_slot_restored_from_disk = True
+                self._runtime_state_signature = self._current_runtime_signature()
+                self._persist_runtime_state_locked()
+        return {
+            "restored": True,
+            "context_id": context_id,
+            "snapshot": self._named_context_public_dict(snapshot),
+        }
+
+    def _named_context_filename(
+        self,
+        *,
+        context_id: str,
+        model_id: str,
+        slot_id: int,
+    ) -> str:
+        return self._session_restore_filename(
+            conversation_id=context_id,
+            model_id=model_id,
+            slot_id=slot_id,
+        )
+
+    def _persist_named_context_snapshot(
+        self,
+        *,
+        context_id: str,
+        state: ContinuationState,
+    ) -> bool:
+        existing = self._get_named_context_snapshot(context_id)
+        filename = (
+            existing.save_filename
+            if existing is not None and existing.save_filename
+            else self._named_context_filename(
+                context_id=context_id,
+                model_id=state.model_id,
+                slot_id=state.slot_id,
+            )
+        )
+        try:
+            result = self._slot_action(
+                slot_id=state.slot_id,
+                action="save",
+                payload={"filename": filename},
+            )
+        except Exception as exc:
+            with self._lock:
+                self._named_context_counts["save_error"] = (
+                    self._named_context_counts.get("save_error", 0) + 1
+                )
+                self._last_named_context_save = {
+                    "ok": False,
+                    "context_id": context_id,
+                    "slot_id": state.slot_id,
+                    "filename": filename,
+                    "error": str(exc),
+                    "timestamp": round(time.time(), 3),
+                }
+            return False
+
+        timings = result.get("timings", {})
+        snapshot = SessionRestoreSnapshot(
+            conversation_id=context_id,
+            model_id=state.model_id,
+            slot_id=state.slot_id,
+            estimated_prompt_tokens=state.estimated_prompt_tokens,
+            prefix_digest=state.prefix_digest,
+            request_shape_digest=state.request_shape_digest,
+            prompt_mode=state.prompt_mode,
+            message_count=state.message_count,
+            slot_message_count=state.slot_message_count,
+            save_filename=filename,
+            state_payload=self._serialize_continuation_state(state),
+            saved_at=time.time(),
+            last_access_at=time.time(),
+            save_ms=timings.get("save_ms"),
+            n_saved=int(result.get("n_saved", 0) or 0),
+            n_written=int(result.get("n_written", 0) or 0),
+            restore_count=0 if existing is None else existing.restore_count,
+            last_restore_at=None if existing is None else existing.last_restore_at,
+            last_restore_ms=None if existing is None else existing.last_restore_ms,
+            last_restore_n_restored=(
+                0 if existing is None else existing.last_restore_n_restored
+            ),
+            last_restore_n_read=0 if existing is None else existing.last_restore_n_read,
+            last_restore_status="" if existing is None else existing.last_restore_status,
+            last_restore_error="" if existing is None else existing.last_restore_error,
+            runtime_signature=self._runtime_state_signature,
+        )
+        self._named_context_store.put(snapshot)
+        snapshots = self._named_context_store.list_snapshots(
+            model_id=state.model_id,
+            limit=256,
+        )
+        snapshots.sort(key=lambda item: item.last_access_at, reverse=True)
+        evicted = 0
+        for stale_snapshot in snapshots[_NAMED_CONTEXT_RECENT_LIMIT:]:
+            stale_slot_file = self._slot_save_path / stale_snapshot.save_filename
+            if stale_slot_file.exists():
+                stale_slot_file.unlink()
+            if self._named_context_store.delete(
+                conversation_id=stale_snapshot.conversation_id,
+                model_id=stale_snapshot.model_id,
+            ):
+                evicted += 1
+        with self._lock:
+            self._named_context_counts["saved"] = (
+                self._named_context_counts.get("saved", 0) + 1
+            )
+            if evicted:
+                self._named_context_counts["evicted"] = (
+                    self._named_context_counts.get("evicted", 0) + evicted
+                )
+            self._last_named_context_save = {
+                "ok": True,
+                "context_id": context_id,
+                "slot_id": state.slot_id,
+                "filename": filename,
+                "save_ms": timings.get("save_ms"),
+                "n_saved": result.get("n_saved"),
+                "n_written": result.get("n_written"),
+                "evicted": evicted,
+                "timestamp": round(time.time(), 3),
+            }
+        return True
+
+    def _state_can_resume(
+        self,
+        current: ContinuationState,
+        target: ContinuationState,
+    ) -> bool:
+        if current.model_id != target.model_id:
+            return False
+        if current.request_shape_digest != target.request_shape_digest:
+            return False
+        if current.prompt_mode != target.prompt_mode:
+            return False
+        if current.prompt_mode == "messages":
+            current_value = current.slot_prompt_value
+            target_value = target.prompt_value
+            return bool(
+                isinstance(current_value, tuple)
+                and isinstance(target_value, tuple)
+                and len(target_value) >= len(current_value)
+                and target_value[: len(current_value)] == current_value
+            )
+        return str(target.prompt_value).startswith(str(current.slot_prompt_value))
+
+    def _try_restore_named_context_snapshot(
+        self,
+        *,
+        context_id: str,
+        slot_id: int,
+        target_state: ContinuationState,
+    ) -> Optional[ContinuationState]:
+        snapshot = self._named_context_store.get(
+            conversation_id=context_id,
+            model_id=target_state.model_id,
+            touch=False,
+        )
+        if snapshot is None:
+            snapshot = self._get_named_context_snapshot(context_id)
+        if snapshot is None:
+            with self._lock:
+                self._named_context_counts["restore_miss"] = (
+                    self._named_context_counts.get("restore_miss", 0) + 1
+                )
+            return None
+        snapshot_state = self._snapshot_state(snapshot)
+        if snapshot_state is None or not self._state_can_resume(snapshot_state, target_state):
+            with self._lock:
+                self._named_context_counts["restore_miss"] = (
+                    self._named_context_counts.get("restore_miss", 0) + 1
+                )
+            return None
+        if not self._restore_snapshot(
+            snapshot,
+            conversation_id=context_id,
+            slot_id=slot_id,
+            source="context",
+        ):
+            return None
+        return snapshot_state
+
     def _persist_session_snapshot_from_payload(
         self,
         *,
@@ -1618,7 +1968,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
     ) -> bool:
         if path not in {"v1/chat/completions", "v1/completions"}:
             return False
-        conversation_id = _extract_routing_key(payload)
+        conversation_id = _extract_single_slot_key(payload)
         slot_id = payload.get("id_slot")
         if not conversation_id or not isinstance(slot_id, int):
             return False
@@ -1739,7 +2089,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         prefix_drift: bool,
         suffix_only: bool,
     ) -> None:
-        routing_key = _extract_routing_key(prepared) or ""
+        routing_key = _extract_single_slot_key(prepared) or ""
         estimated_prompt_tokens = _estimate_prompt_tokens(prepared)
         decision = ContinuationDecision(
             reason=continuation_reason,
@@ -1755,6 +2105,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         slot_reason_map = {
             "cold_start": "single_slot_cold_start",
             "hit": "single_slot_hit",
+            "named_context_hit": "single_slot_named_context_hit",
             "cold_cache_hit": "single_slot_cold_cache_hit",
             "shared_prefix_hit": "single_slot_shared_prefix_hit",
             "recovery_replay": "single_slot_recovery_replay",
@@ -1783,7 +2134,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         prepared = dict(payload)
         if prepared.get("cache_prompt") is None:
             prepared["cache_prompt"] = True
-        routing_key = _extract_routing_key(prepared)
+        routing_key = _extract_single_slot_key(prepared)
+        context_id = _extract_context_id(prepared)
         if not self.config.enable_session_stickiness:
             self._record_single_slot_outcome(
                 prepared,
@@ -1897,6 +2249,21 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     )
                 reason = "recovery_replay"
 
+        if context_id and not continuation_hit:
+            restored_state = self._try_restore_named_context_snapshot(
+                context_id=context_id,
+                slot_id=0,
+                target_state=next_state,
+            )
+            if restored_state is not None:
+                with self._lock:
+                    self._single_slot_recovery_pending = False
+                    self._single_slot_restored_from_disk = True
+                    self._persist_runtime_state_locked()
+                current = restored_state
+                reason = "named_context_hit"
+                continuation_hit = True
+
         if (
             cold_cache_lookup_allowed
             and
@@ -2008,9 +2375,10 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         )
         if self.config.parallel_slots > 1:
             return
-        conversation_id = _extract_routing_key(payload)
+        conversation_id = _extract_single_slot_key(payload)
         if not conversation_id or payload.get("id_slot") != 0:
             return
+        context_id = _extract_context_id(payload)
         estimated_prompt_tokens = _estimate_prompt_tokens(payload)
         next_state = self._build_continuation_state(
             path,
@@ -2038,6 +2406,12 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             self._single_slot_restored_from_disk = False
             if persisted_snapshot:
                 self._persist_runtime_state_locked()
+        if context_id:
+            named_context_state = replace(next_state, conversation_id=context_id)
+            self._persist_named_context_snapshot(
+                context_id=context_id,
+                state=named_context_state,
+            )
 
     def _record_slot_decision(self, decision: SlotRouteDecision) -> None:
         with self._lock:
@@ -2515,6 +2889,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "continuation": self._single_slot_summary(),
             "session_restore": self._session_restore_summary(),
             "cold_cache": self._cold_cache_summary(),
+            "named_contexts": self._named_context_summary(),
         })
         if props:
             details["props"] = props
@@ -2631,6 +3006,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "continuation": self._single_slot_summary(),
             "session_restore": self._session_restore_summary(),
             "cold_cache": self._cold_cache_summary(),
+            "named_contexts": self._named_context_summary(),
         }
         props = self._request_optional_json("props")
         slots = self._request_optional_json("slots")
@@ -3060,6 +3436,59 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                 "pinned": handle.registration.pinned,
                 "pool": self.model_pool_diagnostics(),
             }
+
+    def list_named_contexts(self, model_id: Optional[str] = None) -> Dict[str, Any]:
+        with self._lock:
+            resolved_model_id = self._resolve_model_id(model_id)
+            handle = self._require_handle_locked(resolved_model_id)
+        if not isinstance(handle.adapter, LlamaCppBackendAdapter):
+            raise BackendError(f"named contexts are not supported for model: {resolved_model_id}")
+        payload = handle.adapter.list_named_contexts()
+        payload["model_id"] = resolved_model_id
+        return payload
+
+    def get_named_context(
+        self,
+        context_id: str,
+        model_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            resolved_model_id = self._resolve_model_id(model_id)
+            handle = self._require_handle_locked(resolved_model_id)
+        if not isinstance(handle.adapter, LlamaCppBackendAdapter):
+            raise BackendError(f"named contexts are not supported for model: {resolved_model_id}")
+        payload = handle.adapter.get_named_context(context_id)
+        payload["model_id"] = resolved_model_id
+        return payload
+
+    def delete_named_context(
+        self,
+        context_id: str,
+        model_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            resolved_model_id = self._resolve_model_id(model_id)
+            handle = self._require_handle_locked(resolved_model_id)
+        if not isinstance(handle.adapter, LlamaCppBackendAdapter):
+            raise BackendError(f"named contexts are not supported for model: {resolved_model_id}")
+        payload = handle.adapter.delete_named_context(context_id)
+        payload["model_id"] = resolved_model_id
+        return payload
+
+    def restore_named_context(
+        self,
+        context_id: str,
+        model_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved_model_id = self._resolve_model_id(model_id)
+        self.load_model(resolved_model_id, reason="context_restore")
+        with self._lock:
+            handle = self._require_handle_locked(resolved_model_id)
+        if not isinstance(handle.adapter, LlamaCppBackendAdapter):
+            raise BackendError(f"named contexts are not supported for model: {resolved_model_id}")
+        payload = handle.adapter.restore_named_context(context_id)
+        payload["model_id"] = resolved_model_id
+        return payload
 
     def _touch_model_locked(self, model_id: str) -> None:
         handle = self._require_handle_locked(model_id)

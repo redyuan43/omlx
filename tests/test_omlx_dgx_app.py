@@ -147,6 +147,15 @@ class FakeModelPoolBackend(FakeBackend):
             }
         }
         self.default_model_id = "primary"
+        self.named_contexts = {
+            "primary": {
+                "ctx-a": {
+                    "context_id": "ctx-a",
+                    "slot_save_exists": True,
+                    "estimated_prompt_tokens": 1024,
+                }
+            }
+        }
 
     def model_pool_diagnostics(self) -> dict:
         return {
@@ -186,6 +195,39 @@ class FakeModelPoolBackend(FakeBackend):
     def set_model_pin(self, model_id: str, pinned: bool) -> dict:
         self.models[model_id]["pinned"] = pinned
         return {"model_id": model_id, "pinned": pinned}
+
+    def list_named_contexts(self, model_id: str | None = None) -> dict:
+        resolved = model_id or self.default_model_id
+        contexts = list(self.named_contexts.get(resolved, {}).values())
+        return {
+            "enabled": True,
+            "model_id": resolved,
+            "stats": {"snapshots": len(contexts), "metadata_bytes": 0},
+            "counts": {"saved": len(contexts)},
+            "contexts": contexts,
+        }
+
+    def get_named_context(self, context_id: str, model_id: str | None = None) -> dict:
+        resolved = model_id or self.default_model_id
+        payload = self.named_contexts.get(resolved, {}).get(context_id)
+        if payload is None:
+            raise app_module.BackendError(f"unknown named context: {context_id}")
+        return {"model_id": resolved, **payload}
+
+    def delete_named_context(self, context_id: str, model_id: str | None = None) -> dict:
+        resolved = model_id or self.default_model_id
+        contexts = self.named_contexts.setdefault(resolved, {})
+        if context_id not in contexts:
+            raise app_module.BackendError(f"unknown named context: {context_id}")
+        del contexts[context_id]
+        return {"deleted": True, "model_id": resolved, "context_id": context_id}
+
+    def restore_named_context(self, context_id: str, model_id: str | None = None) -> dict:
+        resolved = model_id or self.default_model_id
+        contexts = self.named_contexts.get(resolved, {})
+        if context_id not in contexts:
+            raise app_module.BackendError(f"unknown named context: {context_id}")
+        return {"restored": True, "model_id": resolved, "context_id": context_id}
 
 
 def _request(app, method: str, path: str, **kwargs):
@@ -877,6 +919,37 @@ def test_admin_model_pool_endpoints_round_trip(tmp_path: Path):
     assert registration.idle_unload_seconds == 120
     assert registration.pinned is True
     assert registration.primary_service == "ocr"
+
+
+def test_admin_named_context_endpoints_round_trip(tmp_path: Path):
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.ensure_model(ModelProfile(model_id="primary", model_alias="qwen35", is_default=True))
+    app = create_app(
+        settings_manager=settings,
+        backend=FakeModelPoolBackend(),
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(app, "GET", "/admin/api/contexts")
+    assert response.status_code == 200
+    assert response.json()["model_id"] == "primary"
+    assert response.json()["contexts"][0]["context_id"] == "ctx-a"
+
+    response = _request(app, "GET", "/admin/api/contexts/ctx-a")
+    assert response.status_code == 200
+    assert response.json()["context_id"] == "ctx-a"
+
+    response = _request(app, "POST", "/admin/api/contexts/ctx-a/restore")
+    assert response.status_code == 200
+    assert response.json()["restored"] is True
+
+    response = _request(app, "DELETE", "/admin/api/contexts/ctx-a")
+    assert response.status_code == 200
+    assert response.json()["deleted"] is True
+
+    response = _request(app, "GET", "/admin/api/contexts")
+    assert response.status_code == 200
+    assert response.json()["contexts"] == []
 
 
 def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path, monkeypatch):
