@@ -64,7 +64,7 @@ def test_settings_manager_persists_default_model(tmp_path: Path):
         ]
         is True
     )
-    assert reloaded.config.backend.model_pool.max_loaded_models == 2
+    assert reloaded.config.backend.model_pool.max_loaded_models == 3
     assert reloaded.config.backend.model_pool.models == {}
 
 
@@ -81,11 +81,13 @@ def test_settings_manager_persists_llama_cpp_model_pool_registration(tmp_path: P
             ttl_seconds=900,
             idle_unload_seconds=120,
             supports_vision=True,
+            primary_service="ocr",
         ),
         profile=ModelProfile(
             model_id="qwen35-4b-secondary",
             model_alias="qwen35-secondary",
             supports_vision=True,
+            primary_service="ocr",
         ),
     )
 
@@ -99,7 +101,10 @@ def test_settings_manager_persists_llama_cpp_model_pool_registration(tmp_path: P
     assert registration.ttl_seconds == 900
     assert registration.idle_unload_seconds == 120
     assert registration.supports_vision is True
+    assert registration.primary_service == "ocr"
+    assert reloaded.config.models["qwen35-4b-secondary"].primary_service == "ocr"
     assert reloaded.config.public_models()[0]["capabilities"]["vision_chat"] is True
+    assert reloaded.config.public_models()[0]["primary_service"] == "ocr"
 
 
 def test_model_profile_infers_multimodal_capabilities_from_name():
@@ -114,9 +119,11 @@ def test_model_profile_infers_multimodal_capabilities_from_name():
     embedding_profile = ModelProfile(model_id="text-embedding-nomic-embed-text-v1.5")
     assert embedding_profile.supports_embeddings is True
     assert embedding_profile.supports_rerank is False
+    assert embedding_profile.primary_service == "embeddings"
 
     rerank_profile = ModelProfile(model_id="Qwen3-Reranker-0.6B")
     assert rerank_profile.supports_rerank is True
+    assert rerank_profile.primary_service == "rerank"
 
 
 def test_manifest_store_round_trip(tmp_path: Path):

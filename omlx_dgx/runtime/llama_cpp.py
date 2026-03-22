@@ -217,6 +217,8 @@ def _continuation_shape_digest(path: str, payload: Dict[str, Any]) -> str:
 
 
 def _disable_thinking_requested(payload: Dict[str, Any]) -> bool:
+    if payload.get("think") is False:
+        return True
     chat_template_kwargs = payload.get("chat_template_kwargs")
     if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("enable_thinking") is False:
         return True
@@ -295,6 +297,27 @@ def _strip_thinking_content(text: str) -> str:
     if "<think>" in text and "</think>" in text:
         return regular.strip()
     return text
+
+
+def _merge_extra_body(payload: Dict[str, Any]) -> Dict[str, Any]:
+    extra_body = payload.get("extra_body")
+    if not isinstance(extra_body, dict):
+        return payload
+    merged: Dict[str, Any] = dict(extra_body)
+    for key, value in payload.items():
+        if key == "extra_body":
+            continue
+        if (
+            key == "chat_template_kwargs"
+            and isinstance(value, dict)
+            and isinstance(merged.get(key), dict)
+        ):
+            combined = dict(merged[key])
+            combined.update(value)
+            merged[key] = combined
+            continue
+        merged[key] = value
+    return merged
 
 
 @dataclass
@@ -683,6 +706,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "--split-mode",
             self.config.split_mode,
         ]
+        if self.config.mmproj_path:
+            args.extend(["--mmproj", self.config.mmproj_path])
         args.extend(["--flash-attn", "on" if self.config.flash_attn else "off"])
         effective_cache_reuse = self._effective_cache_reuse()
         if effective_cache_reuse > 0:
@@ -1887,11 +1912,19 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         }
 
     def _prepare_proxy_payload(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        prepared = dict(payload)
+        prepared = _merge_extra_body(dict(payload))
         if path not in {"v1/chat/completions", "v1/completions"}:
             return prepared
         if prepared.get("cache_prompt") is None:
             prepared["cache_prompt"] = True
+        if prepared.get("think") is False:
+            chat_template_kwargs = prepared.get("chat_template_kwargs")
+            if not isinstance(chat_template_kwargs, dict):
+                chat_template_kwargs = {}
+            else:
+                chat_template_kwargs = dict(chat_template_kwargs)
+            chat_template_kwargs.setdefault("enable_thinking", False)
+            prepared["chat_template_kwargs"] = chat_template_kwargs
         if path == "v1/chat/completions" and _disable_thinking_requested(prepared):
             chat_template_kwargs = prepared.get("chat_template_kwargs")
             if not isinstance(chat_template_kwargs, dict):
@@ -1905,6 +1938,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             prepared.setdefault("reasoning_budget", 0)
             prepared.setdefault("reasoning_format", "none")
             prepared.setdefault("thinking_forced_open", False)
+            prepared.pop("think", None)
         if self.config.parallel_slots <= 1:
             return self._prepare_single_slot_payload(path, prepared)
         if not self.config.enable_session_stickiness:
@@ -2340,13 +2374,14 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             self.config.model_repo_id,
         )
         is_rerank = capabilities.rerank
+        has_mmproj = bool(self.config.mmproj_path)
         return BackendCapabilities(
             chat_completions=not is_rerank,
             completions=not is_rerank,
             embeddings=capabilities.embeddings,
             rerank=capabilities.rerank,
-            vision_chat=capabilities.vision_chat,
-            ocr=capabilities.ocr,
+            vision_chat=capabilities.vision_chat or has_mmproj,
+            ocr=capabilities.ocr or has_mmproj,
         )
 
 
@@ -2474,7 +2509,14 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
         for model_id, registration in explicit.items():
             profile = self.runtime_config.models.get(model_id)
             ordinal = 0 if model_id == self._default_model_id else len(resolved)
-            artifact_path = registration.artifact_path or self.config.artifact_path
+            use_parent_artifact = (
+                not registration.artifact_path
+                and not registration.model_repo_id
+                and registration.backend_kind != "openai_compatible"
+            )
+            artifact_path = (
+                self.config.artifact_path if use_parent_artifact else registration.artifact_path
+            )
             resolved[model_id] = LlamaCppModelRegistration(
                 model_id=model_id,
                 model_alias=registration.model_alias
@@ -2484,6 +2526,7 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                 model_repo_id=registration.model_repo_id
                 or ("" if artifact_path else self.config.model_repo_id),
                 artifact_path=artifact_path,
+                mmproj_path=registration.mmproj_path or self.config.mmproj_path,
                 gguf_variant=registration.gguf_variant or self.config.gguf_variant,
                 base_url=registration.base_url
                 or (self.config.base_url if model_id == self._default_model_id else self._derive_model_base_url(ordinal)),
@@ -2503,12 +2546,20 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
         self,
         registration: LlamaCppModelRegistration,
     ) -> BackendConfig:
+        use_parent_artifact = (
+            not registration.artifact_path
+            and not registration.model_repo_id
+            and registration.backend_kind != "openai_compatible"
+        )
         child_config = replace(
             self.config,
             base_url=registration.base_url or self.config.base_url,
             model_repo_id=registration.model_repo_id
             or ("" if registration.artifact_path else self.config.model_repo_id),
-            artifact_path=registration.artifact_path or self.config.artifact_path,
+            artifact_path=(
+                self.config.artifact_path if use_parent_artifact else registration.artifact_path
+            ),
+            mmproj_path=registration.mmproj_path or self.config.mmproj_path,
             gguf_variant=registration.gguf_variant or self.config.gguf_variant,
             launcher_cmd=registration.launcher_cmd,
             model_pool=self.config.model_pool,
@@ -2780,8 +2831,10 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                         "base_url": handle.registration.base_url or handle.adapter.base_url,
                         "backend_kind": handle.registration.backend_kind,
                         "backend_model_name": handle.registration.backend_model_name,
+                        "primary_service": handle.registration.primary_service,
                         "model_repo_id": handle.registration.model_repo_id,
                         "artifact_path": handle.registration.artifact_path,
+                        "mmproj_path": handle.registration.mmproj_path,
                         "gguf_variant": handle.registration.gguf_variant,
                         "serving_preset": handle.registration.serving_preset,
                         "ctx_size": handle.registration.ctx_size

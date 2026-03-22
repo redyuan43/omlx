@@ -186,6 +186,30 @@ def test_llama_cpp_rerank_model_enables_reranking_endpoint(tmp_path: Path):
     assert capabilities.completions is False
 
 
+def test_llama_cpp_mmproj_enables_multimodal_launch_and_capabilities(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-35B-A3B.Q4_K_M.gguf"
+    mmproj_path = tmp_path / "Qwen3.5-35B-A3B.mmproj-Q8_0.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    mmproj_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32121",
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        artifact_path=str(gguf_path),
+        mmproj_path=str(mmproj_path),
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+
+    command = adapter._build_launch_command()
+    capabilities = adapter.capabilities()
+
+    assert "--mmproj" in command
+    assert str(mmproj_path) in command
+    assert capabilities.vision_chat is True
+    assert capabilities.ocr is True
+
+
 def test_llama_cpp_adapter_collects_props_and_slots(tmp_path: Path):
     gguf_path = tmp_path / "Qwen3.5-4B-Q6_K.gguf"
     gguf_path.write_bytes(b"GGUF")
@@ -300,6 +324,49 @@ def test_llama_cpp_model_pool_external_openai_embedding_registration(tmp_path: P
     assert response.json()["model"] == "text-embedding-nomic-embed-text-v1.5"
     assert adapter.capabilities().embeddings is True
     assert adapter.capabilities().chat_completions is False
+
+
+def test_llama_cpp_model_pool_remote_repo_registration_does_not_inherit_parent_artifact(
+    tmp_path: Path,
+):
+    parent_model = tmp_path / "Qwen3.5-35B-A3B.Q4_K_M.gguf"
+    parent_model.write_bytes(b"GGUF")
+    runtime_config = DGXRuntimeConfig(
+        backend=BackendConfig(
+            kind="llama_cpp",
+            base_url="http://127.0.0.1:32122",
+            quant_mode="gguf_experimental",
+            model_source="gguf",
+            artifact_path=str(parent_model),
+            model_pool=LlamaCppModelPoolConfig(
+                models={
+                    "rerank": LlamaCppModelRegistration(
+                        model_id="rerank",
+                        model_alias="rerank-qwen",
+                        model_repo_id="ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF",
+                        base_url="http://127.0.0.1:32123",
+                        supports_rerank=True,
+                        pinned=True,
+                    )
+                }
+            ),
+        ),
+        models={
+            "rerank": ModelProfile(
+                model_id="rerank",
+                model_alias="rerank-qwen",
+                supports_rerank=True,
+            )
+        },
+    )
+
+    adapter = LlamaCppModelPoolAdapter.from_runtime_config(runtime_config, tmp_path)
+    handle = adapter._models["rerank"]
+
+    assert handle.registration.artifact_path == ""
+    assert handle.registration.model_repo_id == "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF"
+    assert handle.adapter.config.artifact_path == ""
+    assert handle.adapter.config.model_repo_id == "ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF"
 
 
 def test_llama_cpp_adapter_surfaces_nvml_errors_in_telemetry(tmp_path: Path, monkeypatch):
@@ -929,6 +996,69 @@ def test_llama_cpp_adapter_preserves_explicit_reasoning_override(tmp_path: Path)
     assert request_payload["reasoning_budget"] == -1
     assert request_payload["enableThinking"] is False
     assert request_payload["reasoning"] is False
+
+
+def test_llama_cpp_adapter_normalizes_disable_thinking_from_extra_body(tmp_path: Path):
+    gguf_path = tmp_path / "Qwen3.5-4B-Q4_K_M.gguf"
+    gguf_path.write_bytes(b"GGUF")
+    config = BackendConfig(
+        kind="llama_cpp",
+        base_url="http://127.0.0.1:32122",
+        artifact_path=str(gguf_path),
+        quant_mode="gguf_experimental",
+        model_source="gguf",
+        parallel_slots=1,
+    )
+    adapter = LlamaCppBackendAdapter.from_backend_config(config, tmp_path)
+    calls = []
+
+    def fake_request(method, path, timeout=0, **kwargs):
+        calls.append((method, path, kwargs))
+        if path in {"health", "v1/models"}:
+            return FakeResponse(
+                json_data={"object": "list", "data": [{"id": "qwen3.5-4b"}]},
+                headers={"content-type": "application/json"},
+            )
+        if path in {"slots", "props"}:
+            if path == "props":
+                return FakeResponse(
+                    json_data={"default_generation_settings": {"n_ctx": 16384}},
+                    headers={"content-type": "application/json"},
+                )
+            return FakeResponse(
+                json_data=[{"id": 0, "is_processing": False}],
+                headers={"content-type": "application/json"},
+            )
+        if path == "v1/chat/completions":
+            return FakeResponse(
+                json_data={
+                    "object": "chat.completion",
+                    "choices": [{"message": {"role": "assistant", "content": "OK"}}],
+                },
+                headers={"content-type": "application/json"},
+            )
+        raise AssertionError(path)
+
+    adapter._request = fake_request  # type: ignore[method-assign]
+
+    adapter.proxy(
+        "POST",
+        "v1/chat/completions",
+        json={
+            "model": "qwen35-4b-gguf",
+            "messages": [{"role": "user", "content": "ping"}],
+            "extra_body": {"think": False},
+        },
+    )
+
+    request_payload = [call for call in calls if call[1] == "v1/chat/completions"][0][2]["json"]
+
+    assert "extra_body" not in request_payload
+    assert "think" not in request_payload
+    assert request_payload["chat_template_kwargs"]["enable_thinking"] is False
+    assert request_payload["enableThinking"] is False
+    assert request_payload["reasoning"] is False
+    assert request_payload["reasoning_format"] == "none"
 
 
 def test_llama_cpp_adapter_strips_disabled_thinking_tags_and_preserves_continuation(

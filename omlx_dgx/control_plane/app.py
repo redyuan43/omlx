@@ -189,6 +189,13 @@ def _parse_model_pool_registration(
                 existing_profile.supports_ocr if existing_profile else False,
             )
         ),
+        primary_service=str(
+            body.get(
+                "primary_service",
+                existing_profile.primary_service if existing_profile else "",
+            )
+            or ""
+        ),
     )
 
     pinned = body.get("pinned")
@@ -237,6 +244,13 @@ def _parse_model_pool_registration(
             body.get(
                 "artifact_path",
                 existing_registration.artifact_path if existing_registration else "",
+            )
+            or ""
+        ),
+        mmproj_path=str(
+            body.get(
+                "mmproj_path",
+                existing_registration.mmproj_path if existing_registration else "",
             )
             or ""
         ),
@@ -308,6 +322,13 @@ def _parse_model_pool_registration(
                 "supports_ocr",
                 existing_registration.supports_ocr if existing_registration else False,
             )
+        ),
+        primary_service=str(
+            body.get(
+                "primary_service",
+                existing_registration.primary_service if existing_registration else "",
+            )
+            or ""
         ),
     )
 
@@ -386,8 +407,12 @@ def _effective_multimodal_support(
     supports_vision = backend_caps.vision_chat
     supports_ocr = backend_caps.ocr
     if profile is not None:
-        supports_vision = supports_vision and profile.supports_vision
-        supports_ocr = supports_ocr and profile.supports_ocr
+        if services.settings.config.backend.kind == "openai_compatible":
+            supports_vision = supports_vision or profile.supports_vision
+            supports_ocr = supports_ocr or profile.supports_ocr
+        else:
+            supports_vision = supports_vision and profile.supports_vision
+            supports_ocr = supports_ocr and profile.supports_ocr
     return {"vision_chat": supports_vision, "ocr": supports_ocr}
 
 
@@ -402,10 +427,44 @@ def _profile_supports_service(
     if service_name == "rerank":
         return profile.supports_rerank
     if service_name in {"chat_completions", "completions", "messages"}:
-        if profile.supports_embeddings or profile.supports_rerank:
+        if profile.primary_service in {"embeddings", "rerank"}:
             return profile.supports_vision or profile.supports_ocr
         return True
     return True
+
+
+def _specialized_generation_rejection(
+    profile: Optional[ModelProfile],
+    payload: dict,
+) -> tuple[str, str] | None:
+    if profile is None:
+        return None
+    primary_service = str(profile.primary_service or "")
+    has_images = _payload_has_image_inputs(payload)
+    ocr_requested = _ocr_requested(payload)
+    if primary_service == "ocr":
+        if not has_images:
+            return (
+                "ocr",
+                "the selected OCR model requires image inputs",
+            )
+        if not ocr_requested:
+            return (
+                "ocr",
+                "the selected OCR model only supports OCR-mode image requests",
+            )
+    if primary_service == "vision_chat":
+        if not has_images:
+            return (
+                "vision_chat",
+                "the selected vision model requires image inputs",
+            )
+        if ocr_requested:
+            return (
+                "ocr",
+                "the selected vision model is not configured as an OCR service",
+            )
+    return None
 
 
 def _effective_service_support(
@@ -557,6 +616,19 @@ def _require_payload_service_support(
             detail_override=service.get("detail"),
             service_override=service.get("service"),
         )
+    service_name = str(service.get("service") or "")
+    if service_name in {"chat_completions", "completions", "messages"}:
+        profile = _resolve_model_profile(payload, services.settings)
+        specialized_rejection = _specialized_generation_rejection(profile, payload)
+        if specialized_rejection is not None:
+            service_override, detail = specialized_rejection
+            _raise_unsupported_capability(
+                services,
+                path,
+                payload=payload,
+                detail_override=detail,
+                service_override=service_override,
+            )
 
 
 def _require_multimodal_support(services: AppServices, path: str, payload: dict) -> None:

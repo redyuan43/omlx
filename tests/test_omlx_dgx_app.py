@@ -152,7 +152,7 @@ class FakeModelPoolBackend(FakeBackend):
         return {
             "enabled": True,
             "default_model_id": self.default_model_id,
-            "max_loaded_models": 2,
+            "max_loaded_models": 3,
             "loaded_models": [
                 model_id for model_id, item in self.models.items() if item["loaded"]
             ],
@@ -423,6 +423,195 @@ def test_chat_completions_rejects_ocr_requests_without_ocr_capability(tmp_path: 
     assert response.json()["detail"]["service"] == "ocr"
 
 
+def test_chat_completions_allows_ocr_for_openai_compatible_profile_declared_ocr_model(tmp_path: Path):
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.config.backend.kind = "openai_compatible"
+    settings.config.backend.base_url = "http://127.0.0.1:11434"
+    settings.ensure_model(
+        ModelProfile(
+            model_id="GLM-OCR",
+            model_alias="ocr-lite",
+            is_default=True,
+            supports_vision=True,
+            supports_ocr=True,
+            primary_service="ocr",
+        )
+    )
+    app = create_app(
+        settings_manager=settings,
+        backend=FakeBackend(),
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(
+        app,
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "ocr-lite",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read all text in this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/a.png"},
+                        },
+                    ],
+                }
+            ],
+            "ocr": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "pong"
+
+
+def test_chat_completions_rejects_plain_chat_for_ocr_specialized_model(tmp_path: Path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            vision_chat=True,
+            ocr=True,
+        )
+    )
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.ensure_model(
+        ModelProfile(
+            model_id="GLM-OCR",
+            model_alias="ocr-lite",
+            is_default=True,
+            supports_vision=True,
+            supports_ocr=True,
+            primary_service="ocr",
+        )
+    )
+    app = create_app(
+        settings_manager=settings,
+        backend=backend,
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(
+        app,
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "ocr-lite",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert response.status_code == 501
+    assert response.json()["detail"]["service"] == "ocr"
+
+
+def test_chat_completions_rejects_non_ocr_image_chat_for_ocr_specialized_model(tmp_path: Path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            vision_chat=True,
+            ocr=True,
+        )
+    )
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.ensure_model(
+        ModelProfile(
+            model_id="GLM-OCR",
+            model_alias="ocr-lite",
+            is_default=True,
+            supports_vision=True,
+            supports_ocr=True,
+            primary_service="ocr",
+        )
+    )
+    app = create_app(
+        settings_manager=settings,
+        backend=backend,
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(
+        app,
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "ocr-lite",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Describe this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/a.png"},
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 501
+    assert response.json()["detail"]["service"] == "ocr"
+
+
+def test_chat_completions_rejects_ocr_mode_for_vision_primary_service(tmp_path: Path):
+    backend = FakeBackend(
+        capabilities=BackendCapabilities(
+            chat_completions=True,
+            completions=True,
+            vision_chat=True,
+            ocr=True,
+        )
+    )
+    settings = DGXSettingsManager(tmp_path / "state")
+    settings.ensure_model(
+        ModelProfile(
+            model_id="Qwen3.5-35B-VL",
+            model_alias="vlm",
+            is_default=True,
+            supports_vision=True,
+            supports_ocr=True,
+            primary_service="vision_chat",
+        )
+    )
+    app = create_app(
+        settings_manager=settings,
+        backend=backend,
+        manifest_store=PersistentManifestStore(tmp_path / "cache"),
+    )
+
+    response = _request(
+        app,
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "vlm",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "Read the text in this image."},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "https://example.com/a.png"},
+                        },
+                    ],
+                }
+            ],
+            "ocr": True,
+        },
+    )
+
+    assert response.status_code == 501
+    assert response.json()["detail"]["service"] == "ocr"
+
+
 def test_embeddings_endpoint_proxies_when_backend_declares_capability(tmp_path: Path):
     backend = FakeBackend(
         capabilities=BackendCapabilities(
@@ -635,6 +824,7 @@ def test_admin_model_pool_endpoints_round_trip(tmp_path: Path):
     response = _request(app, "GET", "/admin/api/runtime/model-pool")
     assert response.status_code == 200
     assert response.json()["default_model_id"] == "primary"
+    assert response.json()["max_loaded_models"] == 3
 
     response = _request(
         app,
@@ -648,6 +838,7 @@ def test_admin_model_pool_endpoints_round_trip(tmp_path: Path):
             "gguf_variant": "Q4_K_S",
             "ttl_seconds": 600,
             "idle_unload_seconds": 120,
+            "primary_service": "ocr",
         },
     )
     assert response.status_code == 200
@@ -685,6 +876,7 @@ def test_admin_model_pool_endpoints_round_trip(tmp_path: Path):
     assert registration.base_url == "http://127.0.0.1:32121"
     assert registration.idle_unload_seconds == 120
     assert registration.pinned is True
+    assert registration.primary_service == "ocr"
 
 
 def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path, monkeypatch):
