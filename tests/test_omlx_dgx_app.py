@@ -881,6 +881,7 @@ def test_admin_model_pool_endpoints_round_trip(tmp_path: Path):
 
 def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path, monkeypatch):
     manager = BenchmarkManager(tmp_path / "state")
+    captured = {}
 
     class _CompletedProcess:
         returncode = 0
@@ -898,7 +899,7 @@ def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path
 
     monkeypatch.setattr(
         "omlx_dgx.control_plane.benchmarks.subprocess.run",
-        lambda *args, **kwargs: _CompletedProcess(),
+        lambda *args, **kwargs: captured.update({"args": args, "kwargs": kwargs}) or _CompletedProcess(),
     )
 
     app = create_app(
@@ -912,6 +913,7 @@ def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path
     assert listed.status_code == 200
     names = [item["name"] for item in listed.json()["benchmarks"]]
     assert "qwen35-4b" in names
+    assert "qwen35-35b" in names
     assert "multimodal-smoke" in names
 
     run_response = _request(
@@ -932,3 +934,16 @@ def test_admin_benchmark_endpoints_run_and_retrieve_latest_report(tmp_path: Path
     assert latest.json()["report_id"] == report_id
     assert latest.json()["report"]["single_session_followup"]["summary"]["followup_avg_sec"] == 0.123
     assert reports.json()["reports"][0]["summary"] is None or isinstance(reports.json()["reports"][0]["summary"], dict)
+
+    run_35b = _request(
+        app,
+        "POST",
+        "/admin/api/benchmarks/qwen35-35b/run",
+        json={},
+    )
+    assert run_35b.status_code == 200
+    command = captured["args"][0]
+    assert "--model" in command
+    assert command[command.index("--model") + 1] == "qwen35-35b"
+    assert "--target-context-tokens" in command
+    assert command[command.index("--target-context-tokens") + 1] == "32768"

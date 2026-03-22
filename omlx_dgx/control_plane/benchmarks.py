@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -22,6 +22,7 @@ class BenchmarkSpec:
     name: str
     script_path: str
     description: str
+    default_overrides: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, str]:
         return asdict(self)
@@ -32,6 +33,18 @@ _BENCHMARK_SPECS: Dict[str, BenchmarkSpec] = {
         name="qwen35-4b",
         script_path="scripts/bench_qwen35_4b.py",
         description="DGX chat benchmark for the managed Qwen3.5-4B control-plane path.",
+    ),
+    "qwen35-35b": BenchmarkSpec(
+        name="qwen35-35b",
+        script_path="scripts/bench_qwen35_4b.py",
+        description="DGX chat benchmark for the managed Qwen3.5-35B control-plane path.",
+        default_overrides={
+            "control_plane_url": "http://127.0.0.1:8008",
+            "runtime_url": "http://127.0.0.1:30000",
+            "model": "qwen35-35b",
+            "target_context_tokens": 32768,
+            "disable_thinking": True,
+        },
     ),
     "multimodal-smoke": BenchmarkSpec(
         name="multimodal-smoke",
@@ -199,7 +212,12 @@ class BenchmarkManager:
         overrides: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         spec = self._require_spec(benchmark_name)
-        request_overrides = self._normalized_overrides(overrides or {})
+        request_overrides = self._normalized_overrides(
+            {
+                **spec.default_overrides,
+                **(overrides or {}),
+            }
+        )
         command = [
             sys.executable,
             str(self.repo_root / spec.script_path),

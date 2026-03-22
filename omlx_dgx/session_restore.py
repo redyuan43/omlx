@@ -149,6 +149,87 @@ class SessionRestoreStore:
         snapshots.sort(key=lambda item: item.saved_at, reverse=True)
         return snapshots[:limit]
 
+    def _iter_snapshots(
+        self,
+        *,
+        model_id: Optional[str] = None,
+    ):
+        for file_path in self.index_root.glob("*/*.json"):
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            snapshot = SessionRestoreSnapshot(**data)
+            if model_id is not None and snapshot.model_id != model_id:
+                continue
+            yield snapshot
+
+    def find_candidates(
+        self,
+        *,
+        model_id: str,
+        request_shape_digest: Optional[str] = None,
+        prompt_mode: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[SessionRestoreSnapshot]:
+        candidates: List[SessionRestoreSnapshot] = []
+        for snapshot in self._iter_snapshots(model_id=model_id):
+            if request_shape_digest and snapshot.request_shape_digest != request_shape_digest:
+                continue
+            if prompt_mode and snapshot.prompt_mode != prompt_mode:
+                continue
+            candidates.append(snapshot)
+        candidates.sort(key=lambda item: item.last_access_at, reverse=True)
+        return candidates[:limit]
+
+    def find_exact_prefix_digest(
+        self,
+        *,
+        model_id: str,
+        prefix_digest: str,
+        request_shape_digest: Optional[str] = None,
+        prompt_mode: Optional[str] = None,
+        exclude_conversation_id: Optional[str] = None,
+        limit: int = 8,
+    ) -> List[SessionRestoreSnapshot]:
+        candidates: List[SessionRestoreSnapshot] = []
+        for snapshot in self._iter_snapshots(model_id=model_id):
+            if exclude_conversation_id and snapshot.conversation_id == exclude_conversation_id:
+                continue
+            if snapshot.prefix_digest != prefix_digest:
+                continue
+            if request_shape_digest and snapshot.request_shape_digest != request_shape_digest:
+                continue
+            if prompt_mode and snapshot.prompt_mode != prompt_mode:
+                continue
+            candidates.append(snapshot)
+        candidates.sort(key=lambda item: item.last_access_at, reverse=True)
+        return candidates[:limit]
+
+    def find_prefix_candidates(
+        self,
+        *,
+        model_id: str,
+        request_shape_digest: Optional[str] = None,
+        prompt_mode: Optional[str] = None,
+        exclude_conversation_id: Optional[str] = None,
+        max_estimated_prompt_tokens: Optional[int] = None,
+        limit: int = 16,
+    ) -> List[SessionRestoreSnapshot]:
+        candidates: List[SessionRestoreSnapshot] = []
+        for snapshot in self._iter_snapshots(model_id=model_id):
+            if exclude_conversation_id and snapshot.conversation_id == exclude_conversation_id:
+                continue
+            if request_shape_digest and snapshot.request_shape_digest != request_shape_digest:
+                continue
+            if prompt_mode and snapshot.prompt_mode != prompt_mode:
+                continue
+            if (
+                max_estimated_prompt_tokens is not None
+                and snapshot.estimated_prompt_tokens > max_estimated_prompt_tokens
+            ):
+                continue
+            candidates.append(snapshot)
+        candidates.sort(key=lambda item: item.last_access_at, reverse=True)
+        return candidates[:limit]
+
     def stats(self) -> Dict[str, int]:
         count = 0
         bytes_on_disk = 0

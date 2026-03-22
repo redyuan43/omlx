@@ -343,6 +343,7 @@ def _runtime_summary(runtime_payload: Dict[str, Any]) -> Dict[str, Any]:
         "last_route": routing.get("last_decision"),
         "continuation": details.get("continuation"),
         "session_restore": details.get("session_restore"),
+        "cold_cache": details.get("cold_cache"),
     }
 
 

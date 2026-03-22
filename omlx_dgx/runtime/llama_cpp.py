@@ -31,6 +31,7 @@ from omlx_dgx.model_capabilities import infer_model_capabilities, infer_multimod
 from omlx_dgx.session_restore import (
     SessionRestoreSnapshot,
     SessionRestoreStore,
+    conversation_key_hash,
     snapshot_key,
 )
 
@@ -52,6 +53,7 @@ _RECYCLE_OWNED_IDLE_SLOT_MIN_AGE_SECONDS = 1.0
 _SINGLE_SLOT_CONTINUATION_TTL_SECONDS = 600.0
 _PERSISTED_RUNTIME_STATE_VERSION = 1
 _SESSION_RESTORE_RECENT_LIMIT = 16
+_COLD_CACHE_RECENT_LIMIT = 16
 _CACHE_REUSE_UNSUPPORTED_TOKENS = (
     "qwen3.5",
     "qwen35",
@@ -576,11 +578,20 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "restore_error": 0,
             "restore_fallback": 0,
         }
+        self._cold_cache_counts: Dict[str, int] = {
+            "exact_hits": 0,
+            "prefix_hits": 0,
+            "miss": 0,
+            "restore_error": 0,
+        }
+        self._last_cold_cache_hit: Optional[Dict[str, Any]] = None
         self._continuation_counts: Dict[str, int] = {
             "disabled": 0,
             "no_conversation_id": 0,
             "cold_start": 0,
             "hit": 0,
+            "cold_cache_hit": 0,
+            "shared_prefix_hit": 0,
             "recovery_replay": 0,
             "prefix_drift": 0,
             "shape_changed": 0,
@@ -603,6 +614,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "unkeyed_recycled_slot": 0,
             "single_slot_cold_start": 0,
             "single_slot_hit": 0,
+            "single_slot_cold_cache_hit": 0,
+            "single_slot_shared_prefix_hit": 0,
             "single_slot_recovery_replay": 0,
             "single_slot_prefix_drift": 0,
             "single_slot_shape_changed": 0,
@@ -955,6 +968,235 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             )
         return result
 
+    def _snapshot_slot_save_exists(self, snapshot: SessionRestoreSnapshot) -> bool:
+        return (self._slot_save_path / snapshot.save_filename).exists()
+
+    def _restore_snapshot(
+        self,
+        snapshot: SessionRestoreSnapshot,
+        *,
+        conversation_id: str,
+        slot_id: int,
+        source: str,
+    ) -> bool:
+        slot_save_file = self._slot_save_path / snapshot.save_filename
+        if not slot_save_file.exists():
+            snapshot.last_restore_at = time.time()
+            snapshot.last_restore_status = "missing_slot_save_file"
+            snapshot.last_restore_error = str(slot_save_file)
+            self._session_restore_store.put(snapshot)
+            with self._lock:
+                if source == "session_restore":
+                    self._session_restore_counts["restore_error"] = (
+                        self._session_restore_counts.get("restore_error", 0) + 1
+                    )
+                    self._last_slot_restore = {
+                        "ok": False,
+                        "conversation_key_hash": _hash_key(conversation_id),
+                        "slot_id": slot_id,
+                        "filename": snapshot.save_filename,
+                        "status": snapshot.last_restore_status,
+                        "error": snapshot.last_restore_error,
+                        "timestamp": round(time.time(), 3),
+                    }
+                else:
+                    self._cold_cache_counts["restore_error"] = (
+                        self._cold_cache_counts.get("restore_error", 0) + 1
+                    )
+                    self._last_cold_cache_hit = {
+                        "ok": False,
+                        "source": source,
+                        "conversation_key_hash": _hash_key(conversation_id),
+                        "matched_conversation_key_hash": conversation_key_hash(
+                            snapshot.conversation_id
+                        ),
+                        "slot_id": slot_id,
+                        "filename": snapshot.save_filename,
+                        "status": snapshot.last_restore_status,
+                        "error": snapshot.last_restore_error,
+                        "timestamp": round(time.time(), 3),
+                    }
+            return False
+
+        try:
+            result = self._slot_action(
+                slot_id=slot_id,
+                action="restore",
+                payload={"filename": snapshot.save_filename},
+            )
+        except Exception as exc:
+            snapshot.last_restore_at = time.time()
+            snapshot.last_restore_status = "restore_error"
+            snapshot.last_restore_error = str(exc)
+            self._session_restore_store.put(snapshot)
+            with self._lock:
+                if source == "session_restore":
+                    self._session_restore_counts["restore_error"] = (
+                        self._session_restore_counts.get("restore_error", 0) + 1
+                    )
+                    self._last_slot_restore = {
+                        "ok": False,
+                        "conversation_key_hash": _hash_key(conversation_id),
+                        "slot_id": slot_id,
+                        "filename": snapshot.save_filename,
+                        "status": snapshot.last_restore_status,
+                        "error": snapshot.last_restore_error,
+                        "timestamp": round(time.time(), 3),
+                    }
+                else:
+                    self._cold_cache_counts["restore_error"] = (
+                        self._cold_cache_counts.get("restore_error", 0) + 1
+                    )
+                    self._last_cold_cache_hit = {
+                        "ok": False,
+                        "source": source,
+                        "conversation_key_hash": _hash_key(conversation_id),
+                        "matched_conversation_key_hash": conversation_key_hash(
+                            snapshot.conversation_id
+                        ),
+                        "slot_id": slot_id,
+                        "filename": snapshot.save_filename,
+                        "status": snapshot.last_restore_status,
+                        "error": snapshot.last_restore_error,
+                        "timestamp": round(time.time(), 3),
+                    }
+            return False
+
+        timings = result.get("timings", {})
+        snapshot.slot_id = slot_id
+        snapshot.last_access_at = time.time()
+        snapshot.restore_count += 1
+        snapshot.last_restore_at = time.time()
+        snapshot.last_restore_ms = timings.get("restore_ms")
+        snapshot.last_restore_n_restored = int(result.get("n_restored", 0) or 0)
+        snapshot.last_restore_n_read = int(result.get("n_read", 0) or 0)
+        snapshot.last_restore_status = "restored"
+        snapshot.last_restore_error = ""
+        snapshot.runtime_signature = self._runtime_state_signature
+        self._session_restore_store.put(snapshot)
+        with self._lock:
+            if source == "session_restore":
+                self._session_restore_counts["restored"] = (
+                    self._session_restore_counts.get("restored", 0) + 1
+                )
+                self._last_slot_restore = {
+                    "ok": True,
+                    "conversation_key_hash": _hash_key(conversation_id),
+                    "slot_id": slot_id,
+                    "filename": snapshot.save_filename,
+                    "restore_ms": timings.get("restore_ms"),
+                    "n_restored": result.get("n_restored"),
+                    "n_read": result.get("n_read"),
+                    "status": snapshot.last_restore_status,
+                    "timestamp": round(time.time(), 3),
+                }
+            else:
+                count_key = "exact_hits" if source == "exact" else "prefix_hits"
+                self._cold_cache_counts[count_key] = (
+                    self._cold_cache_counts.get(count_key, 0) + 1
+                )
+                self._last_cold_cache_hit = {
+                    "ok": True,
+                    "source": source,
+                    "conversation_key_hash": _hash_key(conversation_id),
+                    "matched_conversation_key_hash": conversation_key_hash(
+                        snapshot.conversation_id
+                    ),
+                    "slot_id": slot_id,
+                    "filename": snapshot.save_filename,
+                    "restore_ms": timings.get("restore_ms"),
+                    "n_restored": result.get("n_restored"),
+                    "n_read": result.get("n_read"),
+                    "status": snapshot.last_restore_status,
+                    "timestamp": round(time.time(), 3),
+                }
+        return True
+
+    def _snapshot_state(
+        self,
+        snapshot: SessionRestoreSnapshot,
+    ) -> Optional[ContinuationState]:
+        if not isinstance(snapshot.state_payload, dict):
+            return None
+        return self._deserialize_continuation_state(snapshot.state_payload)
+
+    def _find_exact_cold_cache_snapshot(
+        self,
+        state: ContinuationState,
+    ) -> Optional[SessionRestoreSnapshot]:
+        for snapshot in self._session_restore_store.find_exact_prefix_digest(
+            model_id=state.model_id,
+            prefix_digest=state.prefix_digest,
+            request_shape_digest=state.request_shape_digest,
+            prompt_mode=state.prompt_mode,
+            exclude_conversation_id=state.conversation_id,
+            limit=8,
+        ):
+            if not self._snapshot_slot_save_exists(snapshot):
+                continue
+            return snapshot
+        return None
+
+    def _shared_prefix_match_tokens(
+        self,
+        candidate: ContinuationState,
+        target: ContinuationState,
+    ) -> int:
+        if candidate.model_id != target.model_id:
+            return 0
+        if candidate.request_shape_digest != target.request_shape_digest:
+            return 0
+        if candidate.prompt_mode != target.prompt_mode:
+            return 0
+        if candidate.prompt_mode == "messages":
+            candidate_value = candidate.slot_prompt_value
+            target_value = target.prompt_value
+            if not (
+                isinstance(candidate_value, tuple)
+                and isinstance(target_value, tuple)
+                and len(target_value) >= len(candidate_value)
+                and target_value[: len(candidate_value)] == candidate_value
+            ):
+                return 0
+            if len(target_value) == len(candidate_value):
+                return 0
+            return candidate.estimated_prompt_tokens
+        candidate_value = str(candidate.slot_prompt_value)
+        target_value = str(target.prompt_value)
+        if not target_value.startswith(candidate_value):
+            return 0
+        if len(target_value) == len(candidate_value):
+            return 0
+        return candidate.estimated_prompt_tokens
+
+    def _find_shared_prefix_snapshot(
+        self,
+        state: ContinuationState,
+    ) -> tuple[Optional[SessionRestoreSnapshot], Optional[ContinuationState]]:
+        best_snapshot: Optional[SessionRestoreSnapshot] = None
+        best_state: Optional[ContinuationState] = None
+        best_tokens = 0
+        for snapshot in self._session_restore_store.find_prefix_candidates(
+            model_id=state.model_id,
+            request_shape_digest=state.request_shape_digest,
+            prompt_mode=state.prompt_mode,
+            exclude_conversation_id=state.conversation_id,
+            max_estimated_prompt_tokens=max(0, state.estimated_prompt_tokens - 1),
+            limit=16,
+        ):
+            if not self._snapshot_slot_save_exists(snapshot):
+                continue
+            candidate_state = self._snapshot_state(snapshot)
+            if candidate_state is None:
+                continue
+            matched_tokens = self._shared_prefix_match_tokens(candidate_state, state)
+            if matched_tokens <= best_tokens:
+                continue
+            best_snapshot = snapshot
+            best_state = candidate_state
+            best_tokens = matched_tokens
+        return best_snapshot, best_state
+
     def _should_persist_session_snapshot(
         self,
         *,
@@ -1095,82 +1337,12 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                     "timestamp": round(time.time(), 3),
                 }
             return False
-
-        slot_save_file = self._slot_save_path / snapshot.save_filename
-        if not slot_save_file.exists():
-            snapshot.last_restore_at = time.time()
-            snapshot.last_restore_status = "missing_slot_save_file"
-            snapshot.last_restore_error = str(slot_save_file)
-            self._session_restore_store.put(snapshot)
-            with self._lock:
-                self._session_restore_counts["restore_error"] = (
-                    self._session_restore_counts.get("restore_error", 0) + 1
-                )
-                self._last_slot_restore = {
-                    "ok": False,
-                    "conversation_key_hash": _hash_key(conversation_id),
-                    "slot_id": slot_id,
-                    "filename": snapshot.save_filename,
-                    "status": snapshot.last_restore_status,
-                    "error": snapshot.last_restore_error,
-                    "timestamp": round(time.time(), 3),
-                }
-            return False
-
-        try:
-            result = self._slot_action(
-                slot_id=slot_id,
-                action="restore",
-                payload={"filename": snapshot.save_filename},
-            )
-        except Exception as exc:
-            snapshot.last_restore_at = time.time()
-            snapshot.last_restore_status = "restore_error"
-            snapshot.last_restore_error = str(exc)
-            self._session_restore_store.put(snapshot)
-            with self._lock:
-                self._session_restore_counts["restore_error"] = (
-                    self._session_restore_counts.get("restore_error", 0) + 1
-                )
-                self._last_slot_restore = {
-                    "ok": False,
-                    "conversation_key_hash": _hash_key(conversation_id),
-                    "slot_id": slot_id,
-                    "filename": snapshot.save_filename,
-                    "status": snapshot.last_restore_status,
-                    "error": snapshot.last_restore_error,
-                    "timestamp": round(time.time(), 3),
-                }
-            return False
-
-        timings = result.get("timings", {})
-        snapshot.slot_id = slot_id
-        snapshot.last_access_at = time.time()
-        snapshot.restore_count += 1
-        snapshot.last_restore_at = time.time()
-        snapshot.last_restore_ms = timings.get("restore_ms")
-        snapshot.last_restore_n_restored = int(result.get("n_restored", 0) or 0)
-        snapshot.last_restore_n_read = int(result.get("n_read", 0) or 0)
-        snapshot.last_restore_status = "restored"
-        snapshot.last_restore_error = ""
-        snapshot.runtime_signature = self._runtime_state_signature
-        self._session_restore_store.put(snapshot)
-        with self._lock:
-            self._session_restore_counts["restored"] = (
-                self._session_restore_counts.get("restored", 0) + 1
-            )
-            self._last_slot_restore = {
-                "ok": True,
-                "conversation_key_hash": _hash_key(conversation_id),
-                "slot_id": slot_id,
-                "filename": snapshot.save_filename,
-                "restore_ms": timings.get("restore_ms"),
-                "n_restored": result.get("n_restored"),
-                "n_read": result.get("n_read"),
-                "status": snapshot.last_restore_status,
-                "timestamp": round(time.time(), 3),
-            }
-        return True
+        return self._restore_snapshot(
+            snapshot,
+            conversation_id=conversation_id,
+            slot_id=slot_id,
+            source="session_restore",
+        )
 
     def _persist_runtime_state_locked(self) -> None:
         single_slot_state = self._single_slot_continuation
@@ -1407,6 +1579,36 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "snapshots": public_snapshots,
         }
 
+    def _cold_cache_summary(self) -> Dict[str, Any]:
+        snapshots = self._session_restore_store.list_snapshots(
+            limit=_COLD_CACHE_RECENT_LIMIT,
+        )
+        entries: List[Dict[str, Any]] = []
+        restorable_entries = 0
+        for snapshot in snapshots:
+            payload = snapshot.to_public_dict()
+            payload["slot_save_exists"] = self._snapshot_slot_save_exists(snapshot)
+            if payload["slot_save_exists"]:
+                restorable_entries += 1
+            entries.append(payload)
+        stats = self._session_restore_store.stats()
+        with self._lock:
+            counts = dict(self._cold_cache_counts)
+            last_hit = None if self._last_cold_cache_hit is None else dict(
+                self._last_cold_cache_hit
+            )
+        return {
+            "enabled": self._session_restore_enabled(),
+            "stats": {
+                "entries": stats.get("snapshots", 0),
+                "metadata_bytes": stats.get("metadata_bytes", 0),
+                "restorable_entries": restorable_entries,
+            },
+            "counts": counts,
+            "last_hit": last_hit,
+            "entries": entries,
+        }
+
     def _persist_session_snapshot_from_payload(
         self,
         *,
@@ -1553,6 +1755,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         slot_reason_map = {
             "cold_start": "single_slot_cold_start",
             "hit": "single_slot_hit",
+            "cold_cache_hit": "single_slot_cold_cache_hit",
+            "shared_prefix_hit": "single_slot_shared_prefix_hit",
             "recovery_replay": "single_slot_recovery_replay",
             "prefix_drift": "single_slot_prefix_drift",
             "shape_changed": "single_slot_shape_changed",
@@ -1615,6 +1819,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         prefix_drift = False
         suffix_only = False
         restore_needed = False
+        cold_cache_lookup_allowed = False
+        cold_cache_state: Optional[ContinuationState] = None
         current: Optional[ContinuationState] = None
         with self._lock:
             self._sync_runtime_state_locked()
@@ -1665,6 +1871,13 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                         reason = "hit"
                         continuation_hit = True
 
+        if (
+            reason in {"cold_start", "expired", "slot_reset", "prefix_drift"}
+            and estimated_prompt_tokens >= self._session_restore_threshold()
+            and self._session_restore_store.stats().get("snapshots", 0) > 0
+        ):
+            cold_cache_lookup_allowed = True
+
         if restore_needed:
             if self._try_restore_session_snapshot(
                 conversation_id=routing_key,
@@ -1683,6 +1896,64 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                         self._session_restore_counts.get("restore_fallback", 0) + 1
                     )
                 reason = "recovery_replay"
+
+        if (
+            cold_cache_lookup_allowed
+            and
+            not continuation_hit
+            and reason in {"cold_start", "expired", "slot_reset"}
+        ):
+            exact_snapshot = self._find_exact_cold_cache_snapshot(next_state)
+            if exact_snapshot is not None and self._restore_snapshot(
+                exact_snapshot,
+                conversation_id=routing_key,
+                slot_id=0,
+                source="exact",
+            ):
+                cold_cache_state = self._snapshot_state(exact_snapshot)
+                if cold_cache_state is not None:
+                    with self._lock:
+                        self._single_slot_recovery_pending = False
+                        self._single_slot_restored_from_disk = True
+                        self._persist_runtime_state_locked()
+                    current = cold_cache_state
+                    reason = "cold_cache_hit"
+                    continuation_hit = True
+                else:
+                    with self._lock:
+                        self._cold_cache_counts["miss"] = (
+                            self._cold_cache_counts.get("miss", 0) + 1
+                        )
+
+        if (
+            cold_cache_lookup_allowed
+            and
+            not continuation_hit
+            and reason in {"cold_start", "expired", "slot_reset", "prefix_drift"}
+        ):
+            shared_snapshot, shared_state = self._find_shared_prefix_snapshot(next_state)
+            if (
+                shared_snapshot is not None
+                and shared_state is not None
+                and self._restore_snapshot(
+                    shared_snapshot,
+                    conversation_id=routing_key,
+                    slot_id=0,
+                    source="prefix",
+                )
+            ):
+                with self._lock:
+                    self._single_slot_recovery_pending = False
+                    self._single_slot_restored_from_disk = True
+                    self._persist_runtime_state_locked()
+                current = shared_state
+                reason = "shared_prefix_hit"
+                continuation_hit = True
+            elif shared_snapshot is None:
+                with self._lock:
+                    self._cold_cache_counts["miss"] = (
+                        self._cold_cache_counts.get("miss", 0) + 1
+                    )
 
         if continuation_hit and next_state.prompt_mode == "messages":
             messages = prepared.get("messages")
@@ -2243,6 +2514,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "diagnostics": self.diagnostics().to_dict(),
             "continuation": self._single_slot_summary(),
             "session_restore": self._session_restore_summary(),
+            "cold_cache": self._cold_cache_summary(),
         })
         if props:
             details["props"] = props
@@ -2358,6 +2630,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         payload: Dict[str, Any] = {
             "continuation": self._single_slot_summary(),
             "session_restore": self._session_restore_summary(),
+            "cold_cache": self._cold_cache_summary(),
         }
         props = self._request_optional_json("props")
         slots = self._request_optional_json("slots")
