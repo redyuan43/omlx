@@ -59,3 +59,27 @@ def test_chunk_text_splits_pages_and_limits_size():
     assert chunks[0]["text"] == "Alpha"
     assert chunks[1]["text"] == "Beta"
     assert chunks[2]["text"] == "Gamma"
+
+
+def test_chunk_extraction_keeps_body_and_image_caption_separate():
+    extraction = {
+        "mode": "page_auto",
+        "pages": [
+            {
+                "page": 3,
+                "route": "ocr_text_plus_vlm_caption",
+                "body_text": "Main body text here.",
+                "image_caption": "Chart shows growth over time.",
+            }
+        ],
+    }
+
+    chunks = pdf_qa_pipeline._chunk_extraction(extraction, max_chars=1200)
+
+    assert len(chunks) == 2
+    assert chunks[0]["page"] == 3
+    assert chunks[0]["kind"] == "body_text"
+    assert chunks[0]["text"] == "Main body text here."
+    assert chunks[1]["page"] == 3
+    assert chunks[1]["kind"] == "image_caption"
+    assert chunks[1]["text"] == "Chart shows growth over time."

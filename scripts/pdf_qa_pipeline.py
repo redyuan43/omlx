@@ -14,9 +14,9 @@ from typing import Any, Dict, List
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from pdf_route_extract import classify_pdf_route, extract_direct_text, extract_via_ocr
+    from pdf_route_extract import classify_pdf_route, extract_with_page_strategy
 else:
-    from scripts.pdf_route_extract import classify_pdf_route, extract_direct_text, extract_via_ocr
+    from scripts.pdf_route_extract import classify_pdf_route, extract_with_page_strategy
 
 
 def _http_json(url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -66,17 +66,55 @@ def _chunk_text(text: str, *, max_chars: int = 1200) -> List[Dict[str, Any]]:
     ]
 
 
+def _chunk_extraction(extraction: Dict[str, Any], *, max_chars: int = 1200) -> List[Dict[str, Any]]:
+    if extraction.get("mode") != "page_auto":
+        return _chunk_text(extraction["text"], max_chars=max_chars)
+
+    chunks: List[Dict[str, Any]] = []
+    next_id = 1
+    for page_record in extraction.get("pages", []):
+        page = page_record["page"]
+        body_text = page_record.get("body_text", "").strip()
+        if body_text:
+            for body_chunk in _chunk_text(body_text, max_chars=max_chars):
+                chunks.append(
+                    {
+                        "id": f"chunk_{next_id}",
+                        "page": page,
+                        "kind": "body_text",
+                        "route": page_record.get("route", ""),
+                        "text": body_chunk["text"],
+                    }
+                )
+                next_id += 1
+        image_caption = page_record.get("image_caption", "").strip()
+        if image_caption:
+            chunks.append(
+                {
+                    "id": f"chunk_{next_id}",
+                    "page": page,
+                    "kind": "image_caption",
+                    "route": page_record.get("route", ""),
+                    "text": image_caption,
+                }
+            )
+            next_id += 1
+    return chunks
+
+
 def _retrieve_context(
     *,
     chat_url: str,
     embed_model: str,
     rerank_model: str,
     question: str,
-    text: str,
+    text: str | None = None,
+    extraction: Dict[str, Any] | None = None,
     top_k: int = 8,
     rerank_top_n: int = 4,
 ) -> Dict[str, Any]:
-    chunks = _chunk_text(text)
+    source = extraction if extraction is not None else {"text": text or ""}
+    chunks = _chunk_extraction(source, max_chars=1200)
     if not chunks:
         return {"chunks": [], "selected": [], "context": ""}
 
@@ -91,6 +129,8 @@ def _retrieve_context(
             {
                 "id": chunk["id"],
                 "page": chunk["page"],
+                "kind": chunk.get("kind", "body_text"),
+                "route": chunk.get("route", ""),
                 "text": chunk["text"],
                 "score": _cosine(query_vec, vector),
             }
@@ -110,7 +150,8 @@ def _retrieve_context(
     )
     selected = [top_chunks[item["index"]] for item in rerank["results"][:rerank_top_n]]
     context = "\n\n---\n\n".join(
-        f"[{item['id']} page={item['page']}]\n{item['text']}" for item in selected
+        f"[{item['id']} page={item['page']} kind={item.get('kind', 'body_text')} route={item.get('route', '')}]\n{item['text']}"
+        for item in selected
     )
     return {
         "chunks": chunks,
@@ -135,6 +176,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-rag", action="store_true")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--rerank-top-n", type=int, default=4)
+    parser.add_argument("--strategy", default="extraction_rag")
     parser.add_argument("--output", default=None)
     return parser
 
@@ -143,31 +185,28 @@ def main() -> int:
     args = build_parser().parse_args()
     pdf_path = Path(args.pdf).expanduser().resolve()
     route = classify_pdf_route(pdf_path)
-    if route["preferred_path"] == "direct_text":
-        extraction = extract_direct_text(
-            pdf_path,
-            first_page=args.first_page,
-            last_page=args.last_page,
-        )
-    else:
-        extraction = extract_via_ocr(
-            pdf_path,
-            ocr_url=args.ocr_url,
-            model=args.ocr_model,
-            first_page=args.first_page,
-            last_page=args.last_page,
-        )
+    extraction = extract_with_page_strategy(
+        pdf_path,
+        chat_url=args.chat_url,
+        chat_model=args.chat_model,
+        ocr_url=args.ocr_url,
+        ocr_model=args.ocr_model,
+        first_page=args.first_page,
+        last_page=args.last_page,
+    )
 
     retrieval = None
     if args.disable_rag:
-        context = extraction["text"][: args.max_context_chars]
+        body_text = extraction.get("text", "")
+        caption_text = extraction.get("image_captions", "")
+        context = f"{body_text}\n\n{caption_text}".strip()[: args.max_context_chars]
     else:
         retrieval = _retrieve_context(
             chat_url=args.chat_url,
             embed_model=args.embed_model,
             rerank_model=args.rerank_model,
             question=args.question,
-            text=extraction["text"],
+            extraction=extraction,
             top_k=args.top_k,
             rerank_top_n=args.rerank_top_n,
         )
