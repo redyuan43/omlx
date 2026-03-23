@@ -376,9 +376,12 @@ def _build_page_record(
     body_text: str,
     image_caption: str,
     source_model: Dict[str, str],
+    text_extract_elapsed_sec: float,
     vlm_result: Dict[str, Any] | None = None,
     ocr_result: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
+    ocr_elapsed = 0.0 if ocr_result is None else float(ocr_result["elapsed_sec"])
+    vlm_elapsed = 0.0 if vlm_result is None else float(vlm_result["elapsed_sec"])
     record = {
         "page": page,
         "route": route_decision["route"],
@@ -390,6 +393,12 @@ def _build_page_record(
         "body_text": body_text,
         "image_caption": image_caption,
         "source_model": source_model,
+        "elapsed_sec": round(text_extract_elapsed_sec + ocr_elapsed + vlm_elapsed, 3),
+        "stage_timings": {
+            "text_extract_sec": round(text_extract_elapsed_sec, 3),
+            "ocr_sec": round(ocr_elapsed, 3),
+            "vlm_sec": round(vlm_elapsed, 3),
+        },
         "signals": {
             "text_chars": signals["text_chars"],
             "alpha_chars": signals["alpha_chars"],
@@ -442,7 +451,9 @@ def extract_with_page_strategy(
     with tempfile.TemporaryDirectory(prefix="pdf_route_auto_") as tmpdir:
         tmpdir_path = Path(tmpdir)
         for page_num in range(first_page, end_page + 1):
+            text_t0 = time.time()
             page_text = _pdftotext_page(pdf_path, page_num)
+            text_extract_elapsed_sec = round(time.time() - text_t0, 3)
             signals = _page_text_signals(page_text)
             review = None
             image_path: Path | None = None
@@ -535,6 +546,7 @@ def extract_with_page_strategy(
                     body_text=body_text,
                     image_caption=image_caption,
                     source_model=source_model,
+                    text_extract_elapsed_sec=text_extract_elapsed_sec,
                     vlm_result=vlm_result,
                     ocr_result=ocr_result,
                 )
