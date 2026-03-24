@@ -110,6 +110,18 @@ def _model_pool_backend(backend: BackendAdapter):
     return None
 
 
+def _named_context_backend(backend: BackendAdapter):
+    required = (
+        "list_named_contexts",
+        "get_named_context",
+        "delete_named_context",
+        "restore_named_context",
+    )
+    if all(callable(getattr(backend, name, None)) for name in required):
+        return backend
+    return None
+
+
 def _parse_model_pool_registration(
     body: dict,
     settings: DGXSettingsManager,
@@ -189,6 +201,13 @@ def _parse_model_pool_registration(
                 existing_profile.supports_ocr if existing_profile else False,
             )
         ),
+        primary_service=str(
+            body.get(
+                "primary_service",
+                existing_profile.primary_service if existing_profile else "",
+            )
+            or ""
+        ),
     )
 
     pinned = body.get("pinned")
@@ -237,6 +256,13 @@ def _parse_model_pool_registration(
             body.get(
                 "artifact_path",
                 existing_registration.artifact_path if existing_registration else "",
+            )
+            or ""
+        ),
+        mmproj_path=str(
+            body.get(
+                "mmproj_path",
+                existing_registration.mmproj_path if existing_registration else "",
             )
             or ""
         ),
@@ -309,14 +335,22 @@ def _parse_model_pool_registration(
                 existing_registration.supports_ocr if existing_registration else False,
             )
         ),
+        primary_service=str(
+            body.get(
+                "primary_service",
+                existing_registration.primary_service if existing_registration else "",
+            )
+            or ""
+        ),
     )
 
-    if not registration.artifact_path and not registration.model_repo_id:
-        if existing_registration is None:
-            raise HTTPException(
-                status_code=400,
-                detail="artifact_path or model_repo_id is required for a new pool model",
-            )
+    if registration.backend_kind != "openai_compatible":
+        if not registration.artifact_path and not registration.model_repo_id:
+            if existing_registration is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="artifact_path or model_repo_id is required for a new pool model",
+                )
     return profile, registration
 
 
@@ -386,8 +420,12 @@ def _effective_multimodal_support(
     supports_vision = backend_caps.vision_chat
     supports_ocr = backend_caps.ocr
     if profile is not None:
-        supports_vision = supports_vision and profile.supports_vision
-        supports_ocr = supports_ocr and profile.supports_ocr
+        if services.settings.config.backend.kind == "openai_compatible":
+            supports_vision = supports_vision or profile.supports_vision
+            supports_ocr = supports_ocr or profile.supports_ocr
+        else:
+            supports_vision = supports_vision and profile.supports_vision
+            supports_ocr = supports_ocr and profile.supports_ocr
     return {"vision_chat": supports_vision, "ocr": supports_ocr}
 
 
@@ -402,10 +440,44 @@ def _profile_supports_service(
     if service_name == "rerank":
         return profile.supports_rerank
     if service_name in {"chat_completions", "completions", "messages"}:
-        if profile.supports_embeddings or profile.supports_rerank:
+        if profile.primary_service in {"embeddings", "rerank"}:
             return profile.supports_vision or profile.supports_ocr
         return True
     return True
+
+
+def _specialized_generation_rejection(
+    profile: Optional[ModelProfile],
+    payload: dict,
+) -> tuple[str, str] | None:
+    if profile is None:
+        return None
+    primary_service = str(profile.primary_service or "")
+    has_images = _payload_has_image_inputs(payload)
+    ocr_requested = _ocr_requested(payload)
+    if primary_service == "ocr":
+        if not has_images:
+            return (
+                "ocr",
+                "the selected OCR model requires image inputs",
+            )
+        if not ocr_requested:
+            return (
+                "ocr",
+                "the selected OCR model only supports OCR-mode image requests",
+            )
+    if primary_service == "vision_chat":
+        if not has_images:
+            return (
+                "vision_chat",
+                "the selected vision model requires image inputs",
+            )
+        if ocr_requested:
+            return (
+                "ocr",
+                "the selected vision model is not configured as an OCR service",
+            )
+    return None
 
 
 def _effective_service_support(
@@ -557,6 +629,19 @@ def _require_payload_service_support(
             detail_override=service.get("detail"),
             service_override=service.get("service"),
         )
+    service_name = str(service.get("service") or "")
+    if service_name in {"chat_completions", "completions", "messages"}:
+        profile = _resolve_model_profile(payload, services.settings)
+        specialized_rejection = _specialized_generation_rejection(profile, payload)
+        if specialized_rejection is not None:
+            service_override, detail = specialized_rejection
+            _raise_unsupported_capability(
+                services,
+                path,
+                payload=payload,
+                detail_override=detail,
+                service_override=service_override,
+            )
 
 
 def _require_multimodal_support(services: AppServices, path: str, payload: dict) -> None:
@@ -889,6 +974,12 @@ def create_app(
         pool_backend = _model_pool_backend(services.backend)
         if pool_backend is not None:
             payload["model_pool"] = pool_backend.model_pool_diagnostics()
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is not None:
+            try:
+                payload["named_contexts"] = context_backend.list_named_contexts()
+            except BackendError as exc:
+                payload["named_contexts_error"] = str(exc)
         return payload
 
     @app.get("/admin/api/runtime/capabilities")
@@ -964,6 +1055,58 @@ def create_app(
         services.settings.save()
         try:
             return pool_backend.set_model_pin(model_id, pinned)
+        except BackendError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/contexts")
+    async def admin_list_contexts(model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.list_named_contexts(model_id=model)
+            return context_backend.list_named_contexts()
+        except BackendError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/admin/api/contexts/{context_id}")
+    async def admin_get_context(context_id: str, model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.get_named_context(context_id, model_id=model)
+            return context_backend.get_named_context(context_id)
+        except BackendError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.delete("/admin/api/contexts/{context_id}")
+    async def admin_delete_context(context_id: str, model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.delete_named_context(context_id, model_id=model)
+            return context_backend.delete_named_context(context_id)
+        except BackendError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/admin/api/contexts/{context_id}/restore")
+    async def admin_restore_context(context_id: str, model: Optional[str] = None) -> dict:
+        context_backend = _named_context_backend(services.backend)
+        if context_backend is None:
+            raise HTTPException(status_code=400, detail="named contexts are not supported by this backend")
+        try:
+            pool_backend = _model_pool_backend(services.backend)
+            if pool_backend is not None:
+                return context_backend.restore_named_context(context_id, model_id=model)
+            return context_backend.restore_named_context(context_id)
         except BackendError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

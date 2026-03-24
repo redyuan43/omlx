@@ -32,6 +32,38 @@ This does not yet fork SGLang or TensorRT-LLM internals. Instead, it provides
 the control plane and runtime/storage interfaces that the DGX path can build on
 next.
 
+## AMD Ryzen AI MAX+ 395 Bring-up
+
+The current repo baseline can also be brought up on Linux x86_64 AMD APU hardware
+with ROCm and a HIP build of `llama.cpp`.
+
+Use the repo-local helpers:
+
+- `bash scripts/build_llama_cpp_rocm.sh`
+- `python3 scripts/download_amd_baseline_models.py`
+- `bash scripts/run_amd_qwen35_baseline.sh`
+- `python3 scripts/register_amd_baseline_models.py`
+- `python3 scripts/bootstrap_amd_agx_parity.py`
+- `bash scripts/run_amd_agx_parity_main.sh`
+- `python3 scripts/register_amd_agx_parity_models.py`
+- `bash scripts/run_amd_agx_parity_ocr.sh`
+- `bash scripts/run_amd_agx_parity_stack.sh`
+- `python3 scripts/smoke_amd_agx_parity.py`
+- `bash scripts/stop_amd_agx_parity_stack.sh`
+
+The fixed port, preset, LM Studio, and benchmark flow is documented in
+[`docs/amd-395-bringup.md`](docs/amd-395-bringup.md).
+
+The strict AGX-topology parity flow on AMD is documented in
+[`docs/amd-395-agx-parity.md`](docs/amd-395-agx-parity.md).
+
+User-level `systemd` templates for the AMD AGX parity services are in
+[`ops/systemd/user/README.md`](ops/systemd/user/README.md).
+
+The AMD helper now also supports a rerank-only fallback registration path via
+`python3 scripts/register_amd_baseline_models.py --skip-lmstudio` when the local
+LM Studio daemon is not yet healthy.
+
 ## Current DGX Capability Matrix
 
 The current DGX path now supports four capability classes behind the same

@@ -43,6 +43,8 @@ def serve_command(args: argparse.Namespace) -> None:
         settings.config.backend.model_source = args.model_source
     if args.artifact_path is not None:
         settings.config.backend.artifact_path = args.artifact_path
+    if args.mmproj_path is not None:
+        settings.config.backend.mmproj_path = args.mmproj_path
     if args.gguf_variant is not None:
         settings.config.backend.gguf_variant = args.gguf_variant
     if args.serving_preset is not None:
@@ -130,6 +132,9 @@ def serve_command(args: argparse.Namespace) -> None:
                 model_id=args.model_id,
                 model_alias=args.model_alias,
                 is_default=True,
+                supports_vision=bool(args.mmproj_path),
+                supports_ocr=bool(args.mmproj_path),
+                primary_service=args.primary_service or "",
             )
         )
     else:
@@ -178,7 +183,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     serve.add_argument("--artifact-path", default=None)
+    serve.add_argument("--mmproj-path", default=None)
     serve.add_argument("--gguf-variant", default=None)
+    serve.add_argument(
+        "--primary-service",
+        choices=("chat", "embeddings", "rerank", "vision_chat", "ocr"),
+        default=None,
+    )
     serve.add_argument(
         "--serving-preset",
         choices=tuple(sorted(LLAMA_CPP_SERVING_PRESETS)),

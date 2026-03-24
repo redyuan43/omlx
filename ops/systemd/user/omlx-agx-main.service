@@ -1,0 +1,16 @@
+[Unit]
+Description=oMLX AMD AGX parity main control plane
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/github/omlx
+ExecStart=/usr/bin/bash %h/github/omlx/scripts/run_amd_agx_parity_main.sh --manifest %h/github/omlx/.runtime/amd-agx-parity-manifest.json
+ExecStartPost=/usr/bin/python3 %h/github/omlx/scripts/register_amd_agx_parity_models.py --manifest %h/github/omlx/.runtime/amd-agx-parity-manifest.json
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

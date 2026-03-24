@@ -75,6 +75,30 @@ LLAMA_CPP_SERVING_PRESETS: Dict[str, Dict[str, Any]] = {
 
 RECOMMENDED_LLAMA_CPP_GGUF_MODEL_REPO_ID = "lmstudio-community/Qwen3.5-4B-GGUF:Q4_K_M"
 RECOMMENDED_LLAMA_CPP_GGUF_VARIANT = "Q4_K_M"
+_PRIMARY_SERVICE_VALUES = {"", "chat", "embeddings", "rerank", "vision_chat", "ocr"}
+
+
+def _normalize_primary_service(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized not in _PRIMARY_SERVICE_VALUES:
+        return ""
+    return normalized
+
+
+def _infer_primary_service(
+    *,
+    configured: str,
+    supports_embeddings: bool,
+    supports_rerank: bool,
+) -> str:
+    normalized = _normalize_primary_service(configured)
+    if normalized:
+        return normalized
+    if supports_embeddings and not supports_rerank:
+        return "embeddings"
+    if supports_rerank and not supports_embeddings:
+        return "rerank"
+    return ""
 
 
 _LEGACY_LLAMA_CPP_DEFAULTS: Dict[str, Any] = {
@@ -107,6 +131,7 @@ class LlamaCppModelRegistration:
     backend_model_name: str = ""
     model_repo_id: str = ""
     artifact_path: str = ""
+    mmproj_path: str = ""
     gguf_variant: str = ""
     base_url: str = ""
     launcher_cmd: str = ""
@@ -120,6 +145,7 @@ class LlamaCppModelRegistration:
     supports_rerank: bool = False
     supports_vision: bool = False
     supports_ocr: bool = False
+    primary_service: str = ""
 
     def __post_init__(self) -> None:
         self.model_id = str(self.model_id or "").strip()
@@ -130,6 +156,7 @@ class LlamaCppModelRegistration:
         self.backend_model_name = str(self.backend_model_name or "").strip()
         self.model_repo_id = str(self.model_repo_id or "").strip()
         self.artifact_path = str(self.artifact_path or "").strip()
+        self.mmproj_path = str(self.mmproj_path or "").strip()
         self.gguf_variant = str(self.gguf_variant or "").strip()
         self.base_url = str(self.base_url or "").strip()
         self.launcher_cmd = str(self.launcher_cmd or "").strip()
@@ -150,6 +177,11 @@ class LlamaCppModelRegistration:
         self.supports_rerank = bool(self.supports_rerank or inferred.rerank)
         self.supports_vision = bool(self.supports_vision or inferred.vision_chat)
         self.supports_ocr = bool(self.supports_ocr or inferred.ocr)
+        self.primary_service = _infer_primary_service(
+            configured=self.primary_service,
+            supports_embeddings=self.supports_embeddings,
+            supports_rerank=self.supports_rerank,
+        )
 
     @classmethod
     def from_dict(
@@ -164,7 +196,7 @@ class LlamaCppModelRegistration:
 
 @dataclass
 class LlamaCppModelPoolConfig:
-    max_loaded_models: int = 2
+    max_loaded_models: int = 3
     default_ttl_seconds: int = 0
     default_idle_unload_seconds: int = 0
     models: Dict[str, LlamaCppModelRegistration] = field(default_factory=dict)
@@ -247,6 +279,7 @@ class BackendConfig:
     quant_mode: str = "bf16"
     model_source: str = "hf"
     artifact_path: str = ""
+    mmproj_path: str = ""
     gguf_variant: str = ""
     serving_preset: str = ""
     launcher_cmd: str = ""
@@ -380,6 +413,7 @@ class ModelProfile:
     supports_rerank: bool = False
     supports_vision: bool = False
     supports_ocr: bool = False
+    primary_service: str = ""
 
     def __post_init__(self) -> None:
         inferred = infer_model_capabilities(self.model_id, self.model_alias)
@@ -389,6 +423,11 @@ class ModelProfile:
         self.supports_rerank = bool(self.supports_rerank or inferred.rerank)
         self.supports_vision = bool(self.supports_vision or inferred.vision_chat)
         self.supports_ocr = bool(self.supports_ocr or inferred.ocr)
+        self.primary_service = _infer_primary_service(
+            configured=self.primary_service,
+            supports_embeddings=self.supports_embeddings,
+            supports_rerank=self.supports_rerank,
+        )
 
     def api_name(self) -> str:
         return self.model_alias or self.model_id
@@ -425,6 +464,7 @@ class DGXRuntimeConfig:
                     "max_context_window": profile.max_context_window,
                     "max_tokens": profile.max_tokens,
                     "default": profile.is_default,
+                    "primary_service": profile.primary_service,
                     "capabilities": {
                         "embeddings": profile.supports_embeddings,
                         "rerank": profile.supports_rerank,

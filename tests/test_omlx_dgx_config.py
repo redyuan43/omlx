@@ -64,7 +64,7 @@ def test_settings_manager_persists_default_model(tmp_path: Path):
         ]
         is True
     )
-    assert reloaded.config.backend.model_pool.max_loaded_models == 2
+    assert reloaded.config.backend.model_pool.max_loaded_models == 3
     assert reloaded.config.backend.model_pool.models == {}
 
 
@@ -75,17 +75,20 @@ def test_settings_manager_persists_llama_cpp_model_pool_registration(tmp_path: P
             model_id="qwen35-4b-secondary",
             model_alias="qwen35-secondary",
             artifact_path="/models/Qwen3.5-4B-Q4_K_S.gguf",
+            mmproj_path="/models/Qwen3.5-4B-Q4_K_S.mmproj.gguf",
             base_url="http://127.0.0.1:32121",
             gguf_variant="Q4_K_S",
             pinned=False,
             ttl_seconds=900,
             idle_unload_seconds=120,
             supports_vision=True,
+            primary_service="ocr",
         ),
         profile=ModelProfile(
             model_id="qwen35-4b-secondary",
             model_alias="qwen35-secondary",
             supports_vision=True,
+            primary_service="ocr",
         ),
     )
 
@@ -94,12 +97,16 @@ def test_settings_manager_persists_llama_cpp_model_pool_registration(tmp_path: P
 
     assert reloaded.config.resolve_model_id("qwen35-secondary") == "qwen35-4b-secondary"
     assert registration.artifact_path == "/models/Qwen3.5-4B-Q4_K_S.gguf"
+    assert registration.mmproj_path == "/models/Qwen3.5-4B-Q4_K_S.mmproj.gguf"
     assert registration.base_url == "http://127.0.0.1:32121"
     assert registration.gguf_variant == "Q4_K_S"
     assert registration.ttl_seconds == 900
     assert registration.idle_unload_seconds == 120
     assert registration.supports_vision is True
+    assert registration.primary_service == "ocr"
+    assert reloaded.config.models["qwen35-4b-secondary"].primary_service == "ocr"
     assert reloaded.config.public_models()[0]["capabilities"]["vision_chat"] is True
+    assert reloaded.config.public_models()[0]["primary_service"] == "ocr"
 
 
 def test_model_profile_infers_multimodal_capabilities_from_name():
@@ -114,9 +121,11 @@ def test_model_profile_infers_multimodal_capabilities_from_name():
     embedding_profile = ModelProfile(model_id="text-embedding-nomic-embed-text-v1.5")
     assert embedding_profile.supports_embeddings is True
     assert embedding_profile.supports_rerank is False
+    assert embedding_profile.primary_service == "embeddings"
 
     rerank_profile = ModelProfile(model_id="Qwen3-Reranker-0.6B")
     assert rerank_profile.supports_rerank is True
+    assert rerank_profile.primary_service == "rerank"
 
 
 def test_manifest_store_round_trip(tmp_path: Path):
@@ -284,8 +293,12 @@ def test_cli_serve_persists_llama_cpp_fields(tmp_path: Path, monkeypatch):
             "gguf",
             "--artifact-path",
             "/models/Qwen3.5-4B-Q4_K_M.gguf",
+            "--mmproj-path",
+            "/models/Qwen3.5-4B.mmproj.gguf",
             "--gguf-variant",
             "Q4_K_M",
+            "--primary-service",
+            "vision_chat",
             "--launcher-binary",
             "/opt/llama.cpp/bin/llama-server",
             "--launcher-cmd",
@@ -332,6 +345,7 @@ def test_cli_serve_persists_llama_cpp_fields(tmp_path: Path, monkeypatch):
     assert reloaded.config.backend.quant_mode == "gguf_experimental"
     assert reloaded.config.backend.model_source == "gguf"
     assert reloaded.config.backend.artifact_path == "/models/Qwen3.5-4B-Q4_K_M.gguf"
+    assert reloaded.config.backend.mmproj_path == "/models/Qwen3.5-4B.mmproj.gguf"
     assert reloaded.config.backend.gguf_variant == "Q4_K_M"
     assert reloaded.config.backend.launcher_binary == "/opt/llama.cpp/bin/llama-server"
     assert (
@@ -357,6 +371,7 @@ def test_cli_serve_persists_llama_cpp_fields(tmp_path: Path, monkeypatch):
     assert reloaded.config.backend.no_context_shift is True
     assert reloaded.config.backend.jinja is True
     assert reloaded.config.backend.reasoning_format == "deepseek"
+    assert reloaded.config.models["lmstudio-community/Qwen3.5-4B-GGUF:Q4_K_M"].primary_service == "vision_chat"
 
 
 def test_cli_serve_applies_llama_cpp_single_session_preset(tmp_path: Path, monkeypatch):

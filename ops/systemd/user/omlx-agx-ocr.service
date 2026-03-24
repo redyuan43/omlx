@@ -1,0 +1,15 @@
+[Unit]
+Description=oMLX AMD AGX parity OCR control plane
+After=network-online.target omlx-agx-main.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/github/omlx
+ExecStart=/usr/bin/bash %h/github/omlx/scripts/run_amd_agx_parity_ocr.sh --manifest %h/github/omlx/.runtime/amd-agx-parity-manifest.json
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

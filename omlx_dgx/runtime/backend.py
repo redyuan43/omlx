@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass
@@ -18,11 +20,30 @@ class BackendError(RuntimeError):
     """Raised when the configured backend cannot be reached or proxying fails."""
 
 
-def _parse_optional_int(value: str) -> Optional[int]:
-    value = value.strip()
-    if not value or value in {"[N/A]", "N/A"}:
+def _parse_optional_number(value: Any) -> Optional[float]:
+    text = str(value).strip()
+    if not text or text in {"[N/A]", "N/A"}:
         return None
-    return int(value)
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _parse_optional_int(value: Any) -> Optional[int]:
+    number = _parse_optional_number(value)
+    if number is None:
+        return None
+    return int(round(number))
+
+
+def _parse_optional_bytes_to_mb(value: Any) -> Optional[int]:
+    number = _parse_optional_number(value)
+    if number is None:
+        return None
+    return int(number / (1024 * 1024))
 
 
 def _read_system_memory_kb() -> Dict[str, int]:
@@ -40,6 +61,80 @@ def _read_system_memory_kb() -> Dict[str, int]:
         except (IndexError, ValueError):
             continue
     return values
+
+
+def _extract_first_json_object(raw_text: str) -> Dict[str, Any]:
+    start = raw_text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object found in command output")
+    return json.loads(raw_text[start:])
+
+
+def _apply_nvidia_smi_metrics(metrics: RuntimeMetrics) -> None:
+    result = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    rows = list(csv.reader(io.StringIO(result.stdout)))
+    if not rows:
+        raise RuntimeError("nvidia-smi returned no GPU rows")
+    row = [item.strip() for item in rows[0]]
+    metrics.gpu_name = row[0]
+    metrics.gpu_memory_used_mb = _parse_optional_int(row[1])
+    metrics.gpu_memory_total_mb = _parse_optional_int(row[2])
+    metrics.gpu_util_percent = _parse_optional_int(row[3])
+    metrics.gpu_temperature_c = _parse_optional_int(row[4])
+
+
+def _apply_rocm_smi_metrics(metrics: RuntimeMetrics) -> Dict[str, Any]:
+    result = subprocess.run(
+        [
+            "rocm-smi",
+            "--showproductname",
+            "--showuse",
+            "--showtemp",
+            "--showmeminfo",
+            "vram",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    payload = _extract_first_json_object(result.stdout)
+    if not payload:
+        raise RuntimeError("rocm-smi returned no GPU rows")
+    card_key = sorted(payload.keys())[0]
+    card = payload.get(card_key) or {}
+    if not isinstance(card, dict):
+        raise RuntimeError("rocm-smi returned an invalid JSON payload")
+
+    metrics.gpu_name = (
+        str(card.get("Card Series") or "").strip()
+        or str(card.get("Card Model") or "").strip()
+        or str(card.get("GFX Version") or "").strip()
+        or None
+    )
+    metrics.gpu_memory_used_mb = _parse_optional_bytes_to_mb(
+        card.get("VRAM Total Used Memory (B)")
+    )
+    metrics.gpu_memory_total_mb = _parse_optional_bytes_to_mb(
+        card.get("VRAM Total Memory (B)")
+    )
+    metrics.gpu_util_percent = _parse_optional_int(card.get("GPU use (%)"))
+    metrics.gpu_temperature_c = _parse_optional_int(
+        card.get("Temperature (Sensor edge) (C)")
+    )
+    return {
+        "gpu_metrics_card": card_key,
+        "gpu_metrics_gfx_version": card.get("GFX Version"),
+    }
 
 
 @dataclass
@@ -155,39 +250,38 @@ class HttpOpenAIBackendAdapter(BackendAdapter):
     def collect_metrics(self) -> RuntimeMetrics:
         metrics = RuntimeMetrics(backend_url=self.base_url, healthy=self.health())
         telemetry: Dict[str, Any] = {
-            "gpu_metrics_source": "nvidia-smi",
+            "gpu_metrics_source": None,
             "gpu_metrics_ok": False,
             "gpu_metrics_error": None,
             "system_memory_kb": _read_system_memory_kb(),
         }
-        try:
-            result = subprocess.run(
-                [
-                    "nvidia-smi",
-                    "--query-gpu=name,memory.used,memory.total,utilization.gpu,temperature.gpu",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            rows = list(csv.reader(io.StringIO(result.stdout)))
-            if rows:
-                row = [item.strip() for item in rows[0]]
-                metrics.gpu_name = row[0]
-                metrics.gpu_memory_used_mb = _parse_optional_int(row[1])
-                metrics.gpu_memory_total_mb = _parse_optional_int(row[2])
-                metrics.gpu_util_percent = _parse_optional_int(row[3])
-                metrics.gpu_temperature_c = _parse_optional_int(row[4])
+        probe_errors = []
+        probes = []
+        if shutil.which("nvidia-smi"):
+            probes.append(("nvidia-smi", _apply_nvidia_smi_metrics))
+        if shutil.which("rocm-smi"):
+            probes.append(("rocm-smi", _apply_rocm_smi_metrics))
+        if not probes:
+            telemetry["gpu_metrics_error"] = "no supported GPU telemetry CLI found"
+        for source_name, probe in probes:
+            try:
+                telemetry["gpu_metrics_source"] = source_name
+                extra = probe(metrics)
                 telemetry["gpu_metrics_ok"] = True
-        except FileNotFoundError as exc:
-            telemetry["gpu_metrics_error"] = str(exc)
-        except subprocess.CalledProcessError as exc:
-            telemetry["gpu_metrics_error"] = (
-                exc.stderr.strip() or exc.stdout.strip() or str(exc)
-            )
-        except Exception as exc:
-            telemetry["gpu_metrics_error"] = str(exc)
+                telemetry["gpu_metrics_error"] = None
+                if isinstance(extra, dict):
+                    telemetry.update(extra)
+                break
+            except FileNotFoundError as exc:
+                probe_errors.append(f"{source_name}: {exc}")
+            except subprocess.CalledProcessError as exc:
+                probe_errors.append(
+                    f"{source_name}: {exc.stderr.strip() or exc.stdout.strip() or str(exc)}"
+                )
+            except Exception as exc:
+                probe_errors.append(f"{source_name}: {exc}")
+        if not telemetry["gpu_metrics_ok"] and probe_errors:
+            telemetry["gpu_metrics_error"] = "; ".join(probe_errors)
         metrics.details = {"telemetry": telemetry}
         return metrics
 

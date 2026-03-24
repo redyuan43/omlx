@@ -15,6 +15,31 @@ from typing import Any, Dict, List
 import bench_qwen35_4b as single_bench
 
 
+def _effective_slot_context_tokens(
+    runtime_summary: Dict[str, Any],
+    requested_context_tokens: int,
+) -> int:
+    loaded_context_length = runtime_summary.get("loaded_context_length")
+    effective_context_tokens = (
+        min(requested_context_tokens, loaded_context_length)
+        if isinstance(loaded_context_length, int) and loaded_context_length > 0
+        else requested_context_tokens
+    )
+    backend_format = runtime_summary.get("backend_format")
+    ctx_size = runtime_summary.get("ctx_size")
+    parallel_slots = runtime_summary.get("parallel_slots")
+    if (
+        backend_format == "llama_cpp_gguf"
+        and isinstance(ctx_size, int)
+        and ctx_size > 0
+        and isinstance(parallel_slots, int)
+        and parallel_slots > 1
+    ):
+        slot_context_tokens = max(1024, ctx_size // parallel_slots)
+        effective_context_tokens = min(effective_context_tokens, slot_context_tokens)
+    return effective_context_tokens
+
+
 def _chat_request(
     *,
     control_plane_url: str,
@@ -133,11 +158,11 @@ def main() -> None:
         f"{args.control_plane_url}/admin/api/runtime"
     )
     runtime_summary = single_bench._runtime_summary(runtime_before)  # type: ignore[attr-defined]
+    effective_context_tokens = _effective_slot_context_tokens(
+        runtime_summary,
+        args.target_context_tokens,
+    )
     loaded_context_length = runtime_summary.get("loaded_context_length")
-    if isinstance(loaded_context_length, int) and loaded_context_length > 0:
-        effective_context_tokens = min(args.target_context_tokens, loaded_context_length)
-    else:
-        effective_context_tokens = args.target_context_tokens
 
     prefix_base = "Concurrent llama.cpp Qwen3.5 cache benchmark"
     if args.prefix_salt:
