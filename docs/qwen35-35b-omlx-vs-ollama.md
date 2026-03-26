@@ -1,5 +1,12 @@
 # Qwen3.5-35B on Jetson AGX Orin: oMLX vs Ollama
 
+> Status: this file is retained as an earlier comparison snapshot. For the
+> latest isolated rerun and updated 35B conclusions, see
+> [qwen35-35b-omlx-vs-ollama-20260326.md](/home/agx/github/omlx/docs/qwen35-35b-omlx-vs-ollama-20260326.md).
+> The `2026-03-26` rerun includes isolated `oMLX` and `Ollama` phases, a fair
+> `16K` dual-parallel comparison, and the current note about multimodal
+> `llama.cpp` slot `save/restore` support.
+
 This document compares the current `oMLX + llama.cpp` path against the
 current `Ollama` path for `Qwen3.5-35B` on the same Jetson AGX Orin machine.
 

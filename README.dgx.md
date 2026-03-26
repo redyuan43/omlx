@@ -32,6 +32,9 @@ This does not yet fork SGLang or TensorRT-LLM internals. Instead, it provides
 the control plane and runtime/storage interfaces that the DGX path can build on
 next.
 
+For the current local Jetson `35B + RAG + OCR` usage guide, see
+[docs/jetson-local-service-guide.md](docs/jetson-local-service-guide.md).
+
 ## Mac Path vs DGX Path
 
 The DGX path is not a full port of the Mac runtime. Today it reuses oMLX

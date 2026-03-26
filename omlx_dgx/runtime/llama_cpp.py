@@ -588,6 +588,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         self._runtime_state_path = self.state_dir / "llama_cpp_runtime_state.json"
         self._last_slot_save: Optional[Dict[str, Any]] = None
         self._last_slot_restore: Optional[Dict[str, Any]] = None
+        self._slot_save_restore_supported: Optional[bool] = None
+        self._slot_save_restore_unavailable_reason = ""
         self._session_restore_counts: Dict[str, int] = {
             "saved": 0,
             "restored": 0,
@@ -595,12 +597,14 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "save_error": 0,
             "restore_error": 0,
             "restore_fallback": 0,
+            "unsupported": 0,
         }
         self._cold_cache_counts: Dict[str, int] = {
             "exact_hits": 0,
             "prefix_hits": 0,
             "miss": 0,
             "restore_error": 0,
+            "unsupported": 0,
         }
         self._last_cold_cache_hit: Optional[Dict[str, Any]] = None
         self._named_context_counts: Dict[str, int] = {
@@ -611,6 +615,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             "restore_error": 0,
             "deleted": 0,
             "evicted": 0,
+            "unsupported": 0,
         }
         self._last_named_context_save: Optional[Dict[str, Any]] = None
         self._last_named_context_restore: Optional[Dict[str, Any]] = None
@@ -954,6 +959,7 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         return bool(
             self.config.enable_session_restore
             and self.config.enable_session_stickiness
+            and self._slot_save_restore_supported is not False
         )
 
     def _session_restore_threshold(self) -> int:
@@ -963,6 +969,28 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             or 1
         )
         return max(1, int(threshold))
+
+    def _slot_save_restore_is_unsupported_error(self, message: str) -> bool:
+        normalized = " ".join(str(message).lower().split())
+        if not normalized:
+            return False
+        if "not supported by multimodal" in normalized:
+            return True
+        return (
+            "not_supported_error" in normalized
+            or "this feature is not supported" in normalized
+        )
+
+    def _mark_slot_save_restore_unsupported(self, reason: str) -> None:
+        normalized = " ".join(str(reason).split())
+        with self._lock:
+            self._slot_save_restore_supported = False
+            if normalized and not self._slot_save_restore_unavailable_reason:
+                self._slot_save_restore_unavailable_reason = normalized
+
+    def _slot_save_restore_unavailable_reason_text(self) -> str:
+        with self._lock:
+            return self._slot_save_restore_unavailable_reason
 
     def _session_restore_filename(
         self,
@@ -1074,14 +1102,19 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 payload={"filename": snapshot.save_filename},
             )
         except Exception as exc:
+            error_text = str(exc)
+            unsupported = self._slot_save_restore_is_unsupported_error(error_text)
             snapshot.last_restore_at = time.time()
-            snapshot.last_restore_status = "restore_error"
-            snapshot.last_restore_error = str(exc)
+            snapshot.last_restore_status = "unsupported" if unsupported else "restore_error"
+            snapshot.last_restore_error = error_text
+            if unsupported:
+                self._mark_slot_save_restore_unsupported(error_text)
             store.put(snapshot)
             with self._lock:
                 if source == "session_restore":
-                    self._session_restore_counts["restore_error"] = (
-                        self._session_restore_counts.get("restore_error", 0) + 1
+                    count_key = "unsupported" if unsupported else "restore_error"
+                    self._session_restore_counts[count_key] = (
+                        self._session_restore_counts.get(count_key, 0) + 1
                     )
                     self._last_slot_restore = {
                         "ok": False,
@@ -1093,8 +1126,9 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                         "timestamp": round(time.time(), 3),
                     }
                 elif source == "context":
-                    self._named_context_counts["restore_error"] = (
-                        self._named_context_counts.get("restore_error", 0) + 1
+                    count_key = "unsupported" if unsupported else "restore_error"
+                    self._named_context_counts[count_key] = (
+                        self._named_context_counts.get(count_key, 0) + 1
                     )
                     self._last_named_context_restore = {
                         "ok": False,
@@ -1106,8 +1140,9 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                         "timestamp": round(time.time(), 3),
                     }
                 else:
-                    self._cold_cache_counts["restore_error"] = (
-                        self._cold_cache_counts.get("restore_error", 0) + 1
+                    count_key = "unsupported" if unsupported else "restore_error"
+                    self._cold_cache_counts[count_key] = (
+                        self._cold_cache_counts.get(count_key, 0) + 1
                     )
                     self._last_cold_cache_hit = {
                         "ok": False,
@@ -1326,16 +1361,22 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 payload={"filename": filename},
             )
         except Exception as exc:
+            error_text = str(exc)
+            unsupported = self._slot_save_restore_is_unsupported_error(error_text)
+            if unsupported:
+                self._mark_slot_save_restore_unsupported(error_text)
             with self._lock:
-                self._session_restore_counts["save_error"] = (
-                    self._session_restore_counts.get("save_error", 0) + 1
+                count_key = "unsupported" if unsupported else "save_error"
+                self._session_restore_counts[count_key] = (
+                    self._session_restore_counts.get(count_key, 0) + 1
                 )
                 self._last_slot_save = {
                     "ok": False,
                     "conversation_key_hash": _hash_key(state.conversation_id),
                     "slot_id": state.slot_id,
                     "filename": filename,
-                    "error": str(exc),
+                    "status": "unsupported" if unsupported else "save_error",
+                    "error": error_text,
                     "timestamp": round(time.time(), 3),
                 }
             return False
@@ -1423,7 +1464,11 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
 
     def _persist_runtime_state_locked(self) -> None:
         single_slot_state = self._single_slot_continuation
-        if single_slot_state is not None and self._single_slot_continuation_dirty:
+        if (
+            single_slot_state is not None
+            and self._single_slot_continuation_dirty
+            and self._session_restore_enabled()
+        ):
             durable_snapshot = self._session_restore_store.get(
                 conversation_id=single_slot_state.conversation_id,
                 model_id=single_slot_state.model_id,
@@ -1643,10 +1688,14 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             last_restore = (
                 None if self._last_slot_restore is None else dict(self._last_slot_restore)
             )
+            supported = self._slot_save_restore_supported is not False
+            disabled_reason = self._slot_save_restore_unavailable_reason
         stats = self._session_restore_store.stats()
         stats["restorable_snapshots"] = restorable_snapshots
         return {
             "enabled": self._session_restore_enabled(),
+            "supported": supported,
+            "disabled_reason": disabled_reason,
             "slot_save_path": str(self._slot_save_path),
             "min_prompt_tokens": self._session_restore_threshold(),
             "stats": stats,
@@ -1674,8 +1723,12 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
             last_hit = None if self._last_cold_cache_hit is None else dict(
                 self._last_cold_cache_hit
             )
+            supported = self._slot_save_restore_supported is not False
+            disabled_reason = self._slot_save_restore_unavailable_reason
         return {
             "enabled": self._session_restore_enabled(),
+            "supported": supported,
+            "disabled_reason": disabled_reason,
             "stats": {
                 "entries": stats.get("snapshots", 0),
                 "metadata_bytes": stats.get("metadata_bytes", 0),
@@ -1707,9 +1760,13 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 if self._last_named_context_restore is None
                 else dict(self._last_named_context_restore)
             )
+            supported = self._slot_save_restore_supported is not False
+            disabled_reason = self._slot_save_restore_unavailable_reason
         stats = self._named_context_store.stats()
         return {
-            "enabled": True,
+            "enabled": self._session_restore_enabled(),
+            "supported": supported,
+            "disabled_reason": disabled_reason,
             "stats": stats,
             "counts": counts,
             "last_save": last_save,
@@ -1756,6 +1813,10 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         }
 
     def restore_named_context(self, context_id: str) -> Dict[str, Any]:
+        if not self._session_restore_enabled():
+            reason = self._slot_save_restore_unavailable_reason_text()
+            detail = f": {reason}" if reason else ""
+            raise BackendError(f"named context restore unavailable{detail}")
         snapshot = self._get_named_context_snapshot(context_id)
         if snapshot is None:
             with self._lock:
@@ -1804,6 +1865,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         context_id: str,
         state: ContinuationState,
     ) -> bool:
+        if not self._session_restore_enabled():
+            return False
         existing = self._get_named_context_snapshot(context_id)
         filename = (
             existing.save_filename
@@ -1821,16 +1884,22 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
                 payload={"filename": filename},
             )
         except Exception as exc:
+            error_text = str(exc)
+            unsupported = self._slot_save_restore_is_unsupported_error(error_text)
+            if unsupported:
+                self._mark_slot_save_restore_unsupported(error_text)
             with self._lock:
-                self._named_context_counts["save_error"] = (
-                    self._named_context_counts.get("save_error", 0) + 1
+                count_key = "unsupported" if unsupported else "save_error"
+                self._named_context_counts[count_key] = (
+                    self._named_context_counts.get(count_key, 0) + 1
                 )
                 self._last_named_context_save = {
                     "ok": False,
                     "context_id": context_id,
                     "slot_id": state.slot_id,
                     "filename": filename,
-                    "error": str(exc),
+                    "status": "unsupported" if unsupported else "save_error",
+                    "error": error_text,
                     "timestamp": round(time.time(), 3),
                 }
             return False
@@ -1930,6 +1999,8 @@ class LlamaCppBackendAdapter(HttpOpenAIBackendAdapter):
         slot_id: int,
         target_state: ContinuationState,
     ) -> Optional[ContinuationState]:
+        if not self._session_restore_enabled():
+            return None
         snapshot = self._named_context_store.get(
             conversation_id=context_id,
             model_id=target_state.model_id,
@@ -3153,6 +3224,11 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                 pinned=True,
                 ttl_seconds=0,
                 idle_unload_seconds=0,
+                supports_embeddings=False if primary_profile is None else primary_profile.supports_embeddings,
+                supports_rerank=False if primary_profile is None else primary_profile.supports_rerank,
+                supports_vision=False if primary_profile is None else primary_profile.supports_vision,
+                supports_ocr=False if primary_profile is None else primary_profile.supports_ocr,
+                primary_service="" if primary_profile is None else primary_profile.primary_service,
             )
 
         for model_id, registration in explicit.items():
@@ -3175,7 +3251,8 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
                 model_repo_id=registration.model_repo_id
                 or ("" if artifact_path else self.config.model_repo_id),
                 artifact_path=artifact_path,
-                mmproj_path=registration.mmproj_path or self.config.mmproj_path,
+                mmproj_path=registration.mmproj_path
+                or (self.config.mmproj_path if model_id == self._default_model_id else ""),
                 gguf_variant=registration.gguf_variant or self.config.gguf_variant,
                 base_url=registration.base_url
                 or (self.config.base_url if model_id == self._default_model_id else self._derive_model_base_url(ordinal)),
@@ -3208,7 +3285,8 @@ class LlamaCppModelPoolAdapter(BackendAdapter):
             artifact_path=(
                 self.config.artifact_path if use_parent_artifact else registration.artifact_path
             ),
-            mmproj_path=registration.mmproj_path or self.config.mmproj_path,
+            mmproj_path=registration.mmproj_path
+            or (self.config.mmproj_path if registration.model_id == self._default_model_id else ""),
             gguf_variant=registration.gguf_variant or self.config.gguf_variant,
             launcher_cmd=registration.launcher_cmd,
             model_pool=self.config.model_pool,
